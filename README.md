@@ -17,9 +17,9 @@ Name=myPanel
 
 Comment=Minimal Xfce status panel
 
-Exec=/home/<yourname>/.local/bin/myPanel
+Exec=/home/yourname/.local/bin/myPanel
 
-TryExec=/home/<yourname>/.local/bin/myPanel
+TryExec=/home/yourname/.local/bin/myPanel
 
 Terminal=false
 
