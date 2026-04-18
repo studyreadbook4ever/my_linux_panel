@@ -1,6 +1,8 @@
 # my_linux_panel
 use on xfce4
 
+settings->session and startup click->current session and 'quit program' on xfce4-panel and save session for right usage
+
 download myPanel -> chmod +x on it -> execute! 
 
 to make this permanently background running, get help by GPT gogo
