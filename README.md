@@ -6,6 +6,9 @@ download myPanel -> chmod +x on it -> execute!
 settings->session and startup click->current session and 'quit program' on xfce4-panel and save session for right usage
 
 put this on ~/.config/autostart/mypanel.desktop
+you can do it easily by this command on shell
+>mkdir -p "$HOME/.local/bin"
+install -Dm755 /path/to/your_program "$HOME/.local/bin/mypanel"
 
 [Desktop Entry]
 
@@ -17,9 +20,9 @@ Name=myPanel
 
 Comment=Minimal Xfce status panel
 
-Exec=/home/yourname/.local/bin/myPanel
+Exec=/home/yourname/.local/bin/mypanel
 
-TryExec=/home/yourname/.local/bin/myPanel
+TryExec=/home/yourname/.local/bin/mypanel
 
 Terminal=false
 
