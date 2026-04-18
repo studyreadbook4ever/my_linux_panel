@@ -7,7 +7,10 @@ settings->session and startup click->current session and 'quit program' on xfce4
 
 put this on ~/.config/autostart/mypanel.desktop
 you can do it easily by this command on shell
->mkdir -p "$HOME/.local/bin"
+
+
+mkdir -p "$HOME/.local/bin"
+
 install -Dm755 /path/to/your_program "$HOME/.local/bin/mypanel"
 
 [Desktop Entry]
