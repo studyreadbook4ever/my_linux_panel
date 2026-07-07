@@ -4,7 +4,7 @@
 # my_linux_panel
 
 `my_linux_panel` is a tiny Vista-like translucent desktop panel for Arch Linux
-+ Xfce4 on X11.
++ Xfce4 on X11.(recommand for 'only Xfce4')
 
 It starts as one small `menu` button in the top-left corner. Pressing `menu`
 opens a glass panel with system status text, weather, four user shortcut icons,
