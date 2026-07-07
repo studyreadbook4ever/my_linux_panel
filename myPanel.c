@@ -32,10 +32,15 @@ typedef struct {
     GtkWidget *info_label;
     GtkWidget *weather_icon;
     GtkWidget *weather_label;
-    GtkWidget *spotify_now_box;
-    GtkWidget *spotify_now_icon;
-    GtkWidget *spotify_now_title_label;
-    GtkWidget *spotify_now_artist_label;
+    GtkWidget *spotify_player_box;
+    GtkWidget *spotify_art_image;
+    GtkWidget *spotify_player_title_label;
+    GtkWidget *spotify_player_subtitle_label;
+    GtkWidget *spotify_progress;
+    GtkWidget *spotify_prev_button;
+    GtkWidget *spotify_play_button;
+    GtkWidget *spotify_play_image;
+    GtkWidget *spotify_next_button;
     GtkWidget *icon_buttons[ICON_SLOTS];
     GtkWidget *icon_images[ICON_SLOTS];
     GtkWidget *spotify_button;
@@ -67,7 +72,12 @@ typedef struct {
     char spotify_title[160];
     char spotify_artist[160];
     char spotify_album[160];
+    char spotify_art_url[1024];
+    char spotify_loaded_art_url[1024];
+    gint64 spotify_length_us;
+    gint64 spotify_position_us;
     gboolean spotify_available;
+    gboolean spotify_art_inflight;
 
     char icon_names[ICON_SLOTS][PATH_MAX];
     char icon_commands[ICON_SLOTS][PATH_MAX];
@@ -80,6 +90,8 @@ typedef struct {
 static GtkWidget *make_label(const char *name, const char *text);
 static GtkWidget *make_entry(const char *name, const char *placeholder,
                              const char *value);
+static void image_set_best_icon(GtkWidget *image, const char *const *icons,
+                                const char *fallback);
 static void queue_input_region_update(AppState *st);
 
 static gboolean read_first_line(const char *path, char *buf, size_t len) {
@@ -738,8 +750,22 @@ static gboolean update_weather(gpointer data) {
     return G_SOURCE_CONTINUE;
 }
 
+static gboolean ensure_session_bus(AppState *st) {
+    if (st->session_bus)
+        return TRUE;
+
+    GError *error = NULL;
+    st->session_bus = g_bus_get_sync(G_BUS_TYPE_SESSION, NULL, &error);
+    if (!st->session_bus) {
+        g_clear_error(&error);
+        return FALSE;
+    }
+
+    return TRUE;
+}
+
 static gboolean dbus_name_has_owner(AppState *st, const char *name) {
-    if (!st->session_bus)
+    if (!ensure_session_bus(st))
         return FALSE;
 
     GError *error = NULL;
@@ -771,7 +797,7 @@ static GVariant *dbus_get_property(AppState *st, const char *bus_name,
                                    const char *path,
                                    const char *interface,
                                    const char *property) {
-    if (!st->session_bus)
+    if (!ensure_session_bus(st))
         return NULL;
 
     GError *error = NULL;
@@ -835,35 +861,230 @@ static void copy_metadata_first_string(GVariant *metadata, const char *key,
     g_variant_unref(value);
 }
 
-static void refresh_spotify_now_widgets(AppState *st) {
-    if (!st->spotify_now_title_label || !st->spotify_now_artist_label)
+static gint64 metadata_int64(GVariant *metadata, const char *key) {
+    if (!metadata)
+        return 0;
+
+    GVariant *value = g_variant_lookup_value(metadata, key, NULL);
+    if (!value)
+        return 0;
+
+    gint64 result = 0;
+    const GVariantType *type = g_variant_get_type(value);
+    if (g_variant_type_equal(type, G_VARIANT_TYPE_INT64)) {
+        result = g_variant_get_int64(value);
+    } else if (g_variant_type_equal(type, G_VARIANT_TYPE_INT32)) {
+        result = g_variant_get_int32(value);
+    } else if (g_variant_type_equal(type, G_VARIANT_TYPE_UINT64)) {
+        result = (gint64)g_variant_get_uint64(value);
+    } else if (g_variant_type_equal(type, G_VARIANT_TYPE_UINT32)) {
+        result = g_variant_get_uint32(value);
+    }
+
+    g_variant_unref(value);
+    return result;
+}
+
+static void set_spotify_art_default(AppState *st) {
+    if (!st->spotify_art_image)
+        return;
+
+    const char *spotify_icons[] = {
+        "spotify",
+        "spotify-client",
+        "com.spotify.Client",
+        "spotify-launcher",
+        NULL
+    };
+
+    image_set_best_icon(st->spotify_art_image, spotify_icons,
+                        "multimedia-player");
+    gtk_image_set_pixel_size(GTK_IMAGE(st->spotify_art_image), 42);
+    st->spotify_loaded_art_url[0] = '\0';
+}
+
+static gboolean load_spotify_art_file(AppState *st, const char *path) {
+    if (!st->spotify_art_image || !path || path[0] == '\0')
+        return FALSE;
+
+    GError *error = NULL;
+    GdkPixbuf *pixbuf =
+        gdk_pixbuf_new_from_file_at_scale(path, 54, 54, TRUE, &error);
+    if (!pixbuf) {
+        g_clear_error(&error);
+        return FALSE;
+    }
+
+    gtk_image_set_from_pixbuf(GTK_IMAGE(st->spotify_art_image), pixbuf);
+    g_object_unref(pixbuf);
+    return TRUE;
+}
+
+typedef struct {
+    AppState *st;
+    char url[1024];
+    char path[PATH_MAX];
+} SpotifyArtJob;
+
+static void spotify_art_download_done(GObject *source, GAsyncResult *result,
+                                      gpointer user_data) {
+    GSubprocess *proc = G_SUBPROCESS(source);
+    SpotifyArtJob *job = (SpotifyArtJob *)user_data;
+    GError *error = NULL;
+
+    job->st->spotify_art_inflight = FALSE;
+    if (g_subprocess_wait_check_finish(proc, result, &error) &&
+        strcmp(job->st->spotify_art_url, job->url) == 0 &&
+        load_spotify_art_file(job->st, job->path)) {
+        g_strlcpy(job->st->spotify_loaded_art_url, job->url,
+                  sizeof(job->st->spotify_loaded_art_url));
+    } else {
+        g_clear_error(&error);
+    }
+
+    g_free(job);
+    g_object_unref(proc);
+}
+
+static void cache_spotify_art_url(AppState *st, const char *url) {
+    if (st->spotify_art_inflight || !url || url[0] == '\0')
+        return;
+
+    gchar *curl = g_find_program_in_path("curl");
+    if (!curl)
+        return;
+
+    gchar *cache_dir =
+        g_build_filename(g_get_user_cache_dir(), "myPanel", "spotify-art",
+                         NULL);
+    if (g_mkdir_with_parents(cache_dir, 0700) != 0) {
+        g_free(cache_dir);
+        g_free(curl);
+        return;
+    }
+
+    gchar *checksum =
+        g_compute_checksum_for_string(G_CHECKSUM_SHA256, url, -1);
+    gchar *filename = g_strdup_printf("%s.jpg", checksum);
+    gchar *path = g_build_filename(cache_dir, filename, NULL);
+
+    if (g_file_test(path, G_FILE_TEST_EXISTS)) {
+        if (load_spotify_art_file(st, path))
+            g_strlcpy(st->spotify_loaded_art_url, url,
+                      sizeof(st->spotify_loaded_art_url));
+        g_free(path);
+        g_free(filename);
+        g_free(checksum);
+        g_free(cache_dir);
+        g_free(curl);
+        return;
+    }
+
+    SpotifyArtJob *job = g_new0(SpotifyArtJob, 1);
+    job->st = st;
+    g_strlcpy(job->url, url, sizeof(job->url));
+    g_strlcpy(job->path, path, sizeof(job->path));
+
+    GError *error = NULL;
+    GSubprocess *proc = g_subprocess_new(
+        G_SUBPROCESS_FLAGS_STDOUT_SILENCE | G_SUBPROCESS_FLAGS_STDERR_SILENCE,
+        &error, curl, "-fsSL", "--max-time", "8", "-o", path, url, NULL);
+
+    if (proc) {
+        st->spotify_art_inflight = TRUE;
+        g_subprocess_wait_check_async(proc, NULL, spotify_art_download_done,
+                                      job);
+    } else {
+        g_clear_error(&error);
+        g_free(job);
+    }
+
+    g_free(path);
+    g_free(filename);
+    g_free(checksum);
+    g_free(cache_dir);
+    g_free(curl);
+}
+
+static void refresh_spotify_art(AppState *st) {
+    if (!st->spotify_available || st->spotify_art_url[0] == '\0') {
+        set_spotify_art_default(st);
+        return;
+    }
+
+    if (strcmp(st->spotify_loaded_art_url, st->spotify_art_url) == 0)
+        return;
+
+    if (g_str_has_prefix(st->spotify_art_url, "file://")) {
+        GError *error = NULL;
+        gchar *path = g_filename_from_uri(st->spotify_art_url, NULL, &error);
+        if (path) {
+            if (load_spotify_art_file(st, path))
+                g_strlcpy(st->spotify_loaded_art_url, st->spotify_art_url,
+                          sizeof(st->spotify_loaded_art_url));
+            else
+                set_spotify_art_default(st);
+            g_free(path);
+        } else {
+            g_clear_error(&error);
+            set_spotify_art_default(st);
+        }
+    } else if (g_str_has_prefix(st->spotify_art_url, "http://") ||
+               g_str_has_prefix(st->spotify_art_url, "https://")) {
+        cache_spotify_art_url(st, st->spotify_art_url);
+    } else if (load_spotify_art_file(st, st->spotify_art_url)) {
+        g_strlcpy(st->spotify_loaded_art_url, st->spotify_art_url,
+                  sizeof(st->spotify_loaded_art_url));
+    } else {
+        set_spotify_art_default(st);
+    }
+}
+
+static void format_player_time(gint64 us, char *dest, size_t len) {
+    if (us < 0)
+        us = 0;
+
+    gint64 total_seconds = us / G_USEC_PER_SEC;
+    g_snprintf(dest, len, "%" G_GINT64_FORMAT ":%02" G_GINT64_FORMAT,
+               total_seconds / 60, total_seconds % 60);
+}
+
+static void refresh_spotify_player_widgets(AppState *st) {
+    if (!st->spotify_player_title_label ||
+        !st->spotify_player_subtitle_label ||
+        !st->spotify_progress)
         return;
 
     char title[224];
     char subtitle[256];
-    const char *status = "spotify";
+    char time_left[32];
+    char time_right[32];
+    const char *play_icon = "media-playback-start";
 
     if (!st->spotify_available) {
-        gtk_label_set_text(GTK_LABEL(st->spotify_now_title_label),
-                           "spotify: not running");
-        gtk_label_set_text(GTK_LABEL(st->spotify_now_artist_label),
-                           "press the Spotify icon to launch");
+        gtk_label_set_text(GTK_LABEL(st->spotify_player_title_label),
+                           "Spotify");
+        gtk_label_set_text(GTK_LABEL(st->spotify_player_subtitle_label),
+                           "not running");
+        gtk_progress_bar_set_fraction(GTK_PROGRESS_BAR(st->spotify_progress),
+                                      0.0);
+        gtk_progress_bar_set_text(GTK_PROGRESS_BAR(st->spotify_progress),
+                                  "");
+        if (st->spotify_play_image)
+            gtk_image_set_from_icon_name(GTK_IMAGE(st->spotify_play_image),
+                                         play_icon,
+                                         GTK_ICON_SIZE_MENU);
+        set_spotify_art_default(st);
         return;
     }
 
     if (strcmp(st->spotify_status, "Playing") == 0)
-        status = "playing";
-    else if (strcmp(st->spotify_status, "Paused") == 0)
-        status = "paused";
-    else if (strcmp(st->spotify_status, "Stopped") == 0)
-        status = "stopped";
+        play_icon = "media-playback-pause";
 
-    if (st->spotify_title[0] != '\0') {
-        g_snprintf(title, sizeof(title), "%s: %s",
-                   status, st->spotify_title);
-    } else {
-        g_snprintf(title, sizeof(title), "%s: Spotify", status);
-    }
+    if (st->spotify_title[0] != '\0')
+        g_strlcpy(title, st->spotify_title, sizeof(title));
+    else
+        g_strlcpy(title, "Spotify", sizeof(title));
 
     if (st->spotify_artist[0] != '\0' && st->spotify_album[0] != '\0') {
         g_snprintf(subtitle, sizeof(subtitle), "%s - %s",
@@ -876,22 +1097,46 @@ static void refresh_spotify_now_widgets(AppState *st) {
         g_strlcpy(subtitle, "Spotify", sizeof(subtitle));
     }
 
-    gtk_label_set_text(GTK_LABEL(st->spotify_now_title_label), title);
-    gtk_label_set_text(GTK_LABEL(st->spotify_now_artist_label), subtitle);
+    gtk_label_set_text(GTK_LABEL(st->spotify_player_title_label), title);
+    gtk_label_set_text(GTK_LABEL(st->spotify_player_subtitle_label),
+                       subtitle);
+
+    if (st->spotify_length_us > 0 && st->spotify_position_us >= 0) {
+        double fraction =
+            (double)st->spotify_position_us / (double)st->spotify_length_us;
+        fraction = CLAMP(fraction, 0.0, 1.0);
+        format_player_time(st->spotify_position_us, time_left,
+                           sizeof(time_left));
+        format_player_time(st->spotify_length_us, time_right,
+                           sizeof(time_right));
+        g_snprintf(subtitle, sizeof(subtitle), "%s / %s",
+                   time_left, time_right);
+        gtk_progress_bar_set_fraction(GTK_PROGRESS_BAR(st->spotify_progress),
+                                      fraction);
+        gtk_progress_bar_set_text(GTK_PROGRESS_BAR(st->spotify_progress),
+                                  subtitle);
+    } else {
+        gtk_progress_bar_set_fraction(GTK_PROGRESS_BAR(st->spotify_progress),
+                                      0.0);
+        gtk_progress_bar_set_text(GTK_PROGRESS_BAR(st->spotify_progress),
+                                  "");
+    }
+
+    if (st->spotify_play_image)
+        gtk_image_set_from_icon_name(GTK_IMAGE(st->spotify_play_image),
+                                     play_icon,
+                                     GTK_ICON_SIZE_MENU);
+
+    refresh_spotify_art(st);
 }
 
 static gboolean update_spotify_now(gpointer data) {
     AppState *st = (AppState *)data;
 
-    if (!st->session_bus) {
-        GError *error = NULL;
-        st->session_bus = g_bus_get_sync(G_BUS_TYPE_SESSION, NULL, &error);
-        if (!st->session_bus) {
-            g_clear_error(&error);
-            st->spotify_available = FALSE;
-            refresh_spotify_now_widgets(st);
-            return G_SOURCE_CONTINUE;
-        }
+    if (!ensure_session_bus(st)) {
+        st->spotify_available = FALSE;
+        refresh_spotify_player_widgets(st);
+        return G_SOURCE_CONTINUE;
     }
 
     if (!dbus_name_has_owner(st, "org.mpris.MediaPlayer2.spotify")) {
@@ -900,7 +1145,10 @@ static gboolean update_spotify_now(gpointer data) {
         st->spotify_title[0] = '\0';
         st->spotify_artist[0] = '\0';
         st->spotify_album[0] = '\0';
-        refresh_spotify_now_widgets(st);
+        st->spotify_art_url[0] = '\0';
+        st->spotify_length_us = 0;
+        st->spotify_position_us = 0;
+        refresh_spotify_player_widgets(st);
         return G_SOURCE_CONTINUE;
     }
 
@@ -916,12 +1164,21 @@ static gboolean update_spotify_now(gpointer data) {
         "/org/mpris/MediaPlayer2",
         "org.mpris.MediaPlayer2.Player",
         "Metadata");
+    GVariant *position = dbus_get_property(
+        st,
+        "org.mpris.MediaPlayer2.spotify",
+        "/org/mpris/MediaPlayer2",
+        "org.mpris.MediaPlayer2.Player",
+        "Position");
 
     st->spotify_available = TRUE;
     st->spotify_status[0] = '\0';
     st->spotify_title[0] = '\0';
     st->spotify_artist[0] = '\0';
     st->spotify_album[0] = '\0';
+    st->spotify_art_url[0] = '\0';
+    st->spotify_length_us = 0;
+    st->spotify_position_us = 0;
 
     if (status) {
         g_strlcpy(st->spotify_status,
@@ -940,10 +1197,19 @@ static gboolean update_spotify_now(gpointer data) {
         copy_metadata_string(metadata, "xesam:album",
                              st->spotify_album,
                              sizeof(st->spotify_album));
+        copy_metadata_string(metadata, "mpris:artUrl",
+                             st->spotify_art_url,
+                             sizeof(st->spotify_art_url));
+        st->spotify_length_us = metadata_int64(metadata, "mpris:length");
         g_variant_unref(metadata);
     }
 
-    refresh_spotify_now_widgets(st);
+    if (position) {
+        st->spotify_position_us = g_variant_get_int64(position);
+        g_variant_unref(position);
+    }
+
+    refresh_spotify_player_widgets(st);
     return G_SOURCE_CONTINUE;
 }
 
@@ -1006,6 +1272,9 @@ static gboolean apply_input_region_cb(gpointer data) {
         add_widget_region(st->window, st->icon_buttons[2], region, 2);
         add_widget_region(st->window, st->weather_reset_button, region, 2);
         add_widget_region(st->window, st->icon_buttons[3], region, 2);
+        add_widget_region(st->window, st->spotify_prev_button, region, 2);
+        add_widget_region(st->window, st->spotify_play_button, region, 2);
+        add_widget_region(st->window, st->spotify_next_button, region, 2);
     }
 
     gtk_widget_input_shape_combine_region(st->window, region);
@@ -1198,6 +1467,46 @@ static void on_spotify_clicked(GtkButton *button, gpointer user_data) {
     (void)button;
     (void)user_data;
     launch_spotify();
+}
+
+static void call_spotify_player_method(AppState *st, const char *method) {
+    if (!method || method[0] == '\0')
+        return;
+
+    if (!ensure_session_bus(st))
+        return;
+
+    g_dbus_connection_call(st->session_bus,
+                           "org.mpris.MediaPlayer2.spotify",
+                           "/org/mpris/MediaPlayer2",
+                           "org.mpris.MediaPlayer2.Player",
+                           method,
+                           NULL,
+                           NULL,
+                           G_DBUS_CALL_FLAGS_NONE,
+                           500,
+                           NULL,
+                           NULL,
+                           NULL);
+}
+
+static gboolean refresh_spotify_soon(gpointer data) {
+    update_spotify_now(data);
+    return G_SOURCE_REMOVE;
+}
+
+static void on_spotify_player_clicked(GtkButton *button, gpointer user_data) {
+    AppState *st = (AppState *)user_data;
+    const char *method =
+        (const char *)g_object_get_data(G_OBJECT(button), "spotify-method");
+
+    if (!st->spotify_available) {
+        launch_spotify();
+        return;
+    }
+
+    call_spotify_player_method(st, method);
+    g_timeout_add(250, refresh_spotify_soon, st);
 }
 
 static void on_power_action_clicked(GtkButton *button, gpointer user_data) {
@@ -1426,15 +1735,55 @@ static void apply_css(void) {
         "  font: 11px Sans;"
         "  text-shadow: 0 1px rgba(0,0,0,0.70);"
         "}"
-        "#now-title {"
+        "#spotify-player {"
+        "  min-width: 300px;"
+        "  min-height: 58px;"
+        "  padding: 7px;"
+        "  border-radius: 8px;"
+        "  border: 1px solid rgba(255,255,255,0.34);"
+        "  background-image: linear-gradient(to bottom,"
+        "    rgba(255,255,255,0.17), rgba(18,24,32,0.32));"
+        "  box-shadow: inset 0 1px rgba(255,255,255,0.25);"
+        "}"
+        "#spotify-art {"
+        "  min-width: 54px;"
+        "  min-height: 54px;"
+        "}"
+        "#player-title {"
         "  color: #ffffff;"
         "  font: 700 11px Sans;"
         "  text-shadow: 0 1px rgba(0,0,0,0.70);"
         "}"
-        "#now-subtitle {"
+        "#player-subtitle {"
         "  color: rgba(255,255,255,0.82);"
         "  font: 10px Sans;"
         "  text-shadow: 0 1px rgba(0,0,0,0.64);"
+        "}"
+        "#player-progress {"
+        "  min-height: 7px;"
+        "  margin-top: 2px;"
+        "  font: 8px Sans;"
+        "  color: rgba(255,255,255,0.74);"
+        "}"
+        "#player-progress trough {"
+        "  min-height: 5px;"
+        "  border-radius: 999px;"
+        "  background-color: rgba(255,255,255,0.18);"
+        "}"
+        "#player-progress progress {"
+        "  min-height: 5px;"
+        "  border-radius: 999px;"
+        "  background-image: linear-gradient(to right,"
+        "    rgba(30,215,96,0.92), rgba(153,235,183,0.90));"
+        "}"
+        "#player-control {"
+        "  min-width: 24px;"
+        "  min-height: 24px;"
+        "  padding: 0;"
+        "  border-radius: 999px;"
+        "  border: 1px solid rgba(255,255,255,0.36);"
+        "  background-color: rgba(255,255,255,0.18);"
+        "  box-shadow: inset 0 1px rgba(255,255,255,0.24);"
         "}"
         "#glass-entry {"
         "  min-height: 22px;"
@@ -1515,10 +1864,34 @@ static GtkWidget *build_weather_box(AppState *st) {
     return outer;
 }
 
-static GtkWidget *build_spotify_now_box(AppState *st) {
-    GtkWidget *outer = gtk_box_new(GTK_ORIENTATION_VERTICAL, 5);
-    GtkWidget *row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
-    GtkWidget *text_box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 1);
+static GtkWidget *make_player_button(AppState *st, GtkWidget **image_out,
+                                     const char *icon_name,
+                                     const char *tooltip,
+                                     const char *method) {
+    GtkWidget *button = gtk_button_new();
+    GtkWidget *image = gtk_image_new_from_icon_name(icon_name,
+                                                    GTK_ICON_SIZE_MENU);
+
+    gtk_widget_set_name(button, "player-control");
+    gtk_image_set_pixel_size(GTK_IMAGE(image), 13);
+    gtk_button_set_image(GTK_BUTTON(button), image);
+    gtk_button_set_always_show_image(GTK_BUTTON(button), TRUE);
+    gtk_widget_set_tooltip_text(button, tooltip);
+    g_object_set_data(G_OBJECT(button), "spotify-method", (gpointer)method);
+    g_signal_connect(button, "clicked",
+                     G_CALLBACK(on_spotify_player_clicked), st);
+
+    if (image_out)
+        *image_out = image;
+
+    return button;
+}
+
+static GtkWidget *build_spotify_player_box(AppState *st) {
+    GtkWidget *outer = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 7);
+    GtkWidget *text_box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 2);
+    GtkWidget *controls = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 4);
+    GtkWidget *right_box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 4);
     const char *spotify_icons[] = {
         "spotify",
         "spotify-client",
@@ -1527,34 +1900,65 @@ static GtkWidget *build_spotify_now_box(AppState *st) {
         NULL
     };
 
-    gtk_box_pack_start(GTK_BOX(outer), make_label("section-label", "now playing"),
-                       FALSE, FALSE, 0);
+    gtk_widget_set_name(outer, "spotify-player");
+    gtk_widget_set_size_request(outer, 300, 66);
 
-    st->spotify_now_icon = gtk_image_new();
-    image_set_best_icon(st->spotify_now_icon, spotify_icons,
+    st->spotify_art_image = gtk_image_new();
+    gtk_widget_set_name(st->spotify_art_image, "spotify-art");
+    image_set_best_icon(st->spotify_art_image, spotify_icons,
                         "multimedia-player");
-    st->spotify_now_title_label =
-        make_label("now-title", "spotify: not running");
-    st->spotify_now_artist_label =
-        make_label("now-subtitle", "press the Spotify icon to launch");
+    gtk_image_set_pixel_size(GTK_IMAGE(st->spotify_art_image), 42);
 
-    gtk_label_set_ellipsize(GTK_LABEL(st->spotify_now_title_label),
+    st->spotify_player_title_label =
+        make_label("player-title", "Spotify");
+    st->spotify_player_subtitle_label =
+        make_label("player-subtitle", "not running");
+    st->spotify_progress = gtk_progress_bar_new();
+    gtk_widget_set_name(st->spotify_progress, "player-progress");
+    gtk_progress_bar_set_show_text(GTK_PROGRESS_BAR(st->spotify_progress),
+                                   TRUE);
+
+    gtk_label_set_ellipsize(GTK_LABEL(st->spotify_player_title_label),
                             PANGO_ELLIPSIZE_END);
-    gtk_label_set_ellipsize(GTK_LABEL(st->spotify_now_artist_label),
+    gtk_label_set_ellipsize(GTK_LABEL(st->spotify_player_subtitle_label),
                             PANGO_ELLIPSIZE_END);
-    gtk_widget_set_size_request(st->spotify_now_title_label, 260, -1);
-    gtk_widget_set_size_request(st->spotify_now_artist_label, 260, -1);
+    gtk_widget_set_size_request(st->spotify_player_title_label, 138, -1);
+    gtk_widget_set_size_request(st->spotify_player_subtitle_label, 138, -1);
+    gtk_widget_set_size_request(st->spotify_progress, 138, -1);
 
-    gtk_box_pack_start(GTK_BOX(text_box), st->spotify_now_title_label,
+    st->spotify_prev_button =
+        make_player_button(st, NULL, "media-skip-backward",
+                           "Previous track", "Previous");
+    st->spotify_play_button =
+        make_player_button(st, &st->spotify_play_image,
+                           "media-playback-start",
+                           "Play or pause", "PlayPause");
+    st->spotify_next_button =
+        make_player_button(st, NULL, "media-skip-forward",
+                           "Next track", "Next");
+
+    gtk_box_pack_start(GTK_BOX(text_box), st->spotify_player_title_label,
                        FALSE, FALSE, 0);
-    gtk_box_pack_start(GTK_BOX(text_box), st->spotify_now_artist_label,
+    gtk_box_pack_start(GTK_BOX(text_box), st->spotify_player_subtitle_label,
+                       FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(text_box), st->spotify_progress,
                        FALSE, FALSE, 0);
 
-    gtk_box_pack_start(GTK_BOX(row), st->spotify_now_icon, FALSE, FALSE, 0);
-    gtk_box_pack_start(GTK_BOX(row), text_box, TRUE, TRUE, 0);
-    gtk_box_pack_start(GTK_BOX(outer), row, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(controls), st->spotify_prev_button,
+                       FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(controls), st->spotify_play_button,
+                       FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(controls), st->spotify_next_button,
+                       FALSE, FALSE, 0);
 
-    st->spotify_now_box = outer;
+    gtk_box_pack_start(GTK_BOX(right_box), text_box, FALSE, FALSE, 0);
+    gtk_box_pack_end(GTK_BOX(right_box), controls, FALSE, FALSE, 0);
+
+    gtk_box_pack_start(GTK_BOX(outer), st->spotify_art_image,
+                       FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(outer), right_box, TRUE, TRUE, 0);
+
+    st->spotify_player_box = outer;
     return outer;
 }
 
@@ -1678,9 +2082,9 @@ static GtkWidget *build_ui(AppState *st) {
                        FALSE, FALSE, 0);
     gtk_box_pack_start(GTK_BOX(st->details_box), build_weather_box(st),
                        FALSE, FALSE, 0);
-    gtk_box_pack_start(GTK_BOX(st->details_box), build_spotify_now_box(st),
-                       FALSE, FALSE, 0);
     gtk_box_pack_start(GTK_BOX(st->details_box), build_icon_box(st),
+                       FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(st->details_box), build_spotify_player_box(st),
                        FALSE, FALSE, 0);
 
     gtk_box_pack_start(GTK_BOX(root), st->details_box, FALSE, FALSE, 0);
@@ -1734,7 +2138,7 @@ int main(int argc, char **argv) {
     format_battery(&st);
     refresh_info_label(&st);
     refresh_weather_widgets(&st);
-    refresh_spotify_now_widgets(&st);
+    refresh_spotify_player_widgets(&st);
 
     g_timeout_add(1000, update_time_cb, &st);
     g_timeout_add_seconds(10, update_slow_cb, &st);

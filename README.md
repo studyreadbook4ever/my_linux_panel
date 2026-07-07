@@ -127,9 +127,6 @@ Open state:
 - System status text: time, CPU load, network latency, uptime, battery if present.
 - Top-right power button aligned with the settings icon column.
 - Weather area: weather icon and current weather label.
-- Now playing area: reads `org.mpris.MediaPlayer2.spotify` over DBus and shows
-  the current Spotify playback status, title, artist, and album without
-  launching Spotify by itself.
 - Shortcut row order: shell, internet, Spotify, file, weather settings, settings.
 - Spotify button: launches the local `spotify` wrapper first. That wrapper
   focuses an existing Spotify window or starts the native `spotify-launcher`
@@ -141,6 +138,15 @@ Open state:
   then starts Spotify after installation.
   The icon prefers the official Spotify app icon from the installed system icon
   theme, without bundling Spotify logo files into this repository.
+- Embedded Spotify player: placed directly under the shortcut row. It reads
+  `org.mpris.MediaPlayer2.spotify` over DBus and shows album art, title,
+  artist, album, track progress, and previous/play-pause/next controls without
+  embedding the fragile Spotify app window itself.
+  This player is a custom GTK view built from Spotify/MPRIS metadata and
+  commands, not a native Spotify-provided embedded UI. Because of that, some
+  GTK widget styling can still feel more Linux-toolkit-like than macOS-native;
+  future polish should focus on reducing default GTK widget chrome or drawing
+  the compact media capsule manually.
 - Weather settings icon: opens a weather setup dialog and lets you paste a new
   API URL without editing files manually.
 - Power button: opens a separate dialog with `poweroff`, `suspend`,
