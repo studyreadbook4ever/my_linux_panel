@@ -141,8 +141,9 @@ Open state:
   theme, without bundling Spotify logo files into this repository.
 - Embedded Spotify player: placed directly under the shortcut row. It reads
   `org.mpris.MediaPlayer2.spotify` over DBus and shows album art, title,
-  artist, album, track progress, and previous/play-pause/next controls without
-  embedding the fragile Spotify app window itself.
+  artist, album, track progress, previous/play-pause/next controls, and a
+  top-right Spotify-only volume slider without embedding the fragile Spotify
+  app window itself.
   This player is a custom GTK view built from Spotify/MPRIS metadata and
   commands, not a native Spotify-provided embedded UI. Because of that, some
   GTK widget styling can still feel more Linux-toolkit-like than macOS-native;

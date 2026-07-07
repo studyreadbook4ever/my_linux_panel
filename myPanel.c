@@ -41,6 +41,8 @@ typedef struct {
     GtkWidget *spotify_play_button;
     GtkWidget *spotify_play_image;
     GtkWidget *spotify_next_button;
+    GtkWidget *spotify_volume_image;
+    GtkWidget *spotify_volume_scale;
     GtkWidget *icon_buttons[ICON_SLOTS];
     GtkWidget *icon_images[ICON_SLOTS];
     GtkWidget *spotify_button;
@@ -76,7 +78,10 @@ typedef struct {
     char spotify_loaded_art_url[1024];
     gint64 spotify_length_us;
     gint64 spotify_position_us;
+    double spotify_volume;
     gboolean spotify_available;
+    gboolean spotify_volume_available;
+    gboolean spotify_volume_updating;
     gboolean spotify_art_inflight;
 
     char icon_names[ICON_SLOTS][PATH_MAX];
@@ -826,6 +831,31 @@ static GVariant *dbus_get_property(AppState *st, const char *bus_name,
     return value;
 }
 
+static void dbus_set_property_double(AppState *st, const char *bus_name,
+                                     const char *path,
+                                     const char *interface,
+                                     const char *property,
+                                     double value) {
+    if (!ensure_session_bus(st))
+        return;
+
+    g_dbus_connection_call(st->session_bus,
+                           bus_name,
+                           path,
+                           "org.freedesktop.DBus.Properties",
+                           "Set",
+                           g_variant_new("(ssv)",
+                                         interface,
+                                         property,
+                                         g_variant_new_double(value)),
+                           NULL,
+                           G_DBUS_CALL_FLAGS_NONE,
+                           500,
+                           NULL,
+                           NULL,
+                           NULL);
+}
+
 static void copy_metadata_string(GVariant *metadata, const char *key,
                                  char *dest, size_t len) {
     dest[0] = '\0';
@@ -1049,6 +1079,42 @@ static void format_player_time(gint64 us, char *dest, size_t len) {
                total_seconds / 60, total_seconds % 60);
 }
 
+static void refresh_spotify_volume_widgets(AppState *st) {
+    if (!st->spotify_volume_scale || !st->spotify_volume_image)
+        return;
+
+    double volume = CLAMP(st->spotify_volume, 0.0, 1.0);
+    const char *icon = "audio-volume-medium";
+
+    if (!st->spotify_available || !st->spotify_volume_available) {
+        gtk_widget_set_sensitive(st->spotify_volume_scale, FALSE);
+        gtk_image_set_from_icon_name(GTK_IMAGE(st->spotify_volume_image),
+                                     "audio-volume-muted",
+                                     GTK_ICON_SIZE_MENU);
+        st->spotify_volume_updating = TRUE;
+        gtk_range_set_value(GTK_RANGE(st->spotify_volume_scale), 0.0);
+        st->spotify_volume_updating = FALSE;
+        return;
+    }
+
+    if (volume <= 0.001)
+        icon = "audio-volume-muted";
+    else if (volume < 0.34)
+        icon = "audio-volume-low";
+    else if (volume > 0.72)
+        icon = "audio-volume-high";
+
+    gtk_widget_set_sensitive(st->spotify_volume_scale, TRUE);
+    gtk_image_set_from_icon_name(GTK_IMAGE(st->spotify_volume_image),
+                                 icon,
+                                 GTK_ICON_SIZE_MENU);
+    gtk_widget_set_tooltip_text(st->spotify_volume_scale,
+                                "Spotify volume");
+    st->spotify_volume_updating = TRUE;
+    gtk_range_set_value(GTK_RANGE(st->spotify_volume_scale), volume);
+    st->spotify_volume_updating = FALSE;
+}
+
 static void refresh_spotify_player_widgets(AppState *st) {
     if (!st->spotify_player_title_label ||
         !st->spotify_player_subtitle_label ||
@@ -1074,6 +1140,8 @@ static void refresh_spotify_player_widgets(AppState *st) {
             gtk_image_set_from_icon_name(GTK_IMAGE(st->spotify_play_image),
                                          play_icon,
                                          GTK_ICON_SIZE_MENU);
+        st->spotify_volume_available = FALSE;
+        refresh_spotify_volume_widgets(st);
         set_spotify_art_default(st);
         return;
     }
@@ -1127,6 +1195,7 @@ static void refresh_spotify_player_widgets(AppState *st) {
                                      play_icon,
                                      GTK_ICON_SIZE_MENU);
 
+    refresh_spotify_volume_widgets(st);
     refresh_spotify_art(st);
 }
 
@@ -1148,6 +1217,8 @@ static gboolean update_spotify_now(gpointer data) {
         st->spotify_art_url[0] = '\0';
         st->spotify_length_us = 0;
         st->spotify_position_us = 0;
+        st->spotify_volume = 0.0;
+        st->spotify_volume_available = FALSE;
         refresh_spotify_player_widgets(st);
         return G_SOURCE_CONTINUE;
     }
@@ -1170,6 +1241,12 @@ static gboolean update_spotify_now(gpointer data) {
         "/org/mpris/MediaPlayer2",
         "org.mpris.MediaPlayer2.Player",
         "Position");
+    GVariant *volume = dbus_get_property(
+        st,
+        "org.mpris.MediaPlayer2.spotify",
+        "/org/mpris/MediaPlayer2",
+        "org.mpris.MediaPlayer2.Player",
+        "Volume");
 
     st->spotify_available = TRUE;
     st->spotify_status[0] = '\0';
@@ -1179,6 +1256,7 @@ static gboolean update_spotify_now(gpointer data) {
     st->spotify_art_url[0] = '\0';
     st->spotify_length_us = 0;
     st->spotify_position_us = 0;
+    st->spotify_volume_available = FALSE;
 
     if (status) {
         g_strlcpy(st->spotify_status,
@@ -1208,6 +1286,14 @@ static gboolean update_spotify_now(gpointer data) {
         st->spotify_position_us = g_variant_get_int64(position);
         g_variant_unref(position);
     }
+
+    if (volume && g_variant_is_of_type(volume, G_VARIANT_TYPE_DOUBLE)) {
+        st->spotify_volume = CLAMP(g_variant_get_double(volume), 0.0, 1.0);
+        st->spotify_volume_available = TRUE;
+    }
+
+    if (volume)
+        g_variant_unref(volume);
 
     refresh_spotify_player_widgets(st);
     return G_SOURCE_CONTINUE;
@@ -1275,6 +1361,7 @@ static gboolean apply_input_region_cb(gpointer data) {
         add_widget_region(st->window, st->spotify_prev_button, region, 2);
         add_widget_region(st->window, st->spotify_play_button, region, 2);
         add_widget_region(st->window, st->spotify_next_button, region, 2);
+        add_widget_region(st->window, st->spotify_volume_scale, region, 2);
     }
 
     gtk_widget_input_shape_combine_region(st->window, region);
@@ -1507,6 +1594,25 @@ static void on_spotify_player_clicked(GtkButton *button, gpointer user_data) {
 
     call_spotify_player_method(st, method);
     g_timeout_add(250, refresh_spotify_soon, st);
+}
+
+static void on_spotify_volume_changed(GtkRange *range, gpointer user_data) {
+    AppState *st = (AppState *)user_data;
+
+    if (st->spotify_volume_updating)
+        return;
+
+    if (!st->spotify_available || !st->spotify_volume_available)
+        return;
+
+    st->spotify_volume = CLAMP(gtk_range_get_value(range), 0.0, 1.0);
+    refresh_spotify_volume_widgets(st);
+    dbus_set_property_double(st,
+                             "org.mpris.MediaPlayer2.spotify",
+                             "/org/mpris/MediaPlayer2",
+                             "org.mpris.MediaPlayer2.Player",
+                             "Volume",
+                             st->spotify_volume);
 }
 
 static void on_power_action_clicked(GtkButton *button, gpointer user_data) {
@@ -1862,6 +1968,30 @@ static void apply_css(void) {
         "  background-color: rgba(255,255,255,0.18);"
         "  box-shadow: inset 0 1px rgba(255,255,255,0.24);"
         "}"
+        "#player-volume-box {"
+        "  margin-top: 1px;"
+        "}"
+        "#player-volume-scale {"
+        "  min-width: 56px;"
+        "  min-height: 14px;"
+        "}"
+        "#player-volume-scale trough {"
+        "  min-height: 4px;"
+        "  border-radius: 999px;"
+        "  background-color: rgba(255,255,255,0.18);"
+        "}"
+        "#player-volume-scale highlight {"
+        "  min-height: 4px;"
+        "  border-radius: 999px;"
+        "  background-color: rgba(30,215,96,0.86);"
+        "}"
+        "#player-volume-scale slider {"
+        "  min-width: 8px;"
+        "  min-height: 8px;"
+        "  border-radius: 999px;"
+        "  background-color: rgba(255,255,255,0.92);"
+        "  border: 1px solid rgba(18,24,32,0.30);"
+        "}"
         "#glass-entry {"
         "  min-height: 22px;"
         "  border-radius: 6px;"
@@ -1975,6 +2105,9 @@ static GtkWidget *make_player_button(AppState *st, GtkWidget **image_out,
 static GtkWidget *build_spotify_player_box(AppState *st) {
     GtkWidget *outer = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 7);
     GtkWidget *text_box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 2);
+    GtkWidget *top_row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 5);
+    GtkWidget *label_box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 1);
+    GtkWidget *volume_box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 2);
     GtkWidget *controls = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 4);
     GtkWidget *right_box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 4);
     const char *spotify_icons[] = {
@@ -2002,14 +2135,30 @@ static GtkWidget *build_spotify_player_box(AppState *st) {
     gtk_widget_set_name(st->spotify_progress, "player-progress");
     gtk_progress_bar_set_show_text(GTK_PROGRESS_BAR(st->spotify_progress),
                                    TRUE);
+    st->spotify_volume_image =
+        gtk_image_new_from_icon_name("audio-volume-medium",
+                                     GTK_ICON_SIZE_MENU);
+    st->spotify_volume_scale =
+        gtk_scale_new_with_range(GTK_ORIENTATION_HORIZONTAL, 0.0, 1.0, 0.01);
+    gtk_widget_set_name(volume_box, "player-volume-box");
+    gtk_widget_set_name(st->spotify_volume_scale, "player-volume-scale");
+    gtk_image_set_pixel_size(GTK_IMAGE(st->spotify_volume_image), 12);
+    gtk_scale_set_draw_value(GTK_SCALE(st->spotify_volume_scale), FALSE);
+    gtk_range_set_value(GTK_RANGE(st->spotify_volume_scale), 0.0);
+    gtk_range_set_increments(GTK_RANGE(st->spotify_volume_scale), 0.01, 0.10);
+    gtk_widget_set_tooltip_text(st->spotify_volume_scale,
+                                "Spotify volume");
+    gtk_widget_set_size_request(st->spotify_volume_scale, 56, -1);
+    g_signal_connect(st->spotify_volume_scale, "value-changed",
+                     G_CALLBACK(on_spotify_volume_changed), st);
 
     gtk_label_set_ellipsize(GTK_LABEL(st->spotify_player_title_label),
                             PANGO_ELLIPSIZE_END);
     gtk_label_set_ellipsize(GTK_LABEL(st->spotify_player_subtitle_label),
                             PANGO_ELLIPSIZE_END);
-    gtk_widget_set_size_request(st->spotify_player_title_label, 138, -1);
-    gtk_widget_set_size_request(st->spotify_player_subtitle_label, 138, -1);
-    gtk_widget_set_size_request(st->spotify_progress, 138, -1);
+    gtk_widget_set_size_request(st->spotify_player_title_label, 116, -1);
+    gtk_widget_set_size_request(st->spotify_player_subtitle_label, 116, -1);
+    gtk_widget_set_size_request(st->spotify_progress, 210, -1);
 
     st->spotify_prev_button =
         make_player_button(st, NULL, "media-skip-backward",
@@ -2022,10 +2171,18 @@ static GtkWidget *build_spotify_player_box(AppState *st) {
         make_player_button(st, NULL, "media-skip-forward",
                            "Next track", "Next");
 
-    gtk_box_pack_start(GTK_BOX(text_box), st->spotify_player_title_label,
+    gtk_box_pack_start(GTK_BOX(label_box), st->spotify_player_title_label,
                        FALSE, FALSE, 0);
-    gtk_box_pack_start(GTK_BOX(text_box), st->spotify_player_subtitle_label,
+    gtk_box_pack_start(GTK_BOX(label_box), st->spotify_player_subtitle_label,
                        FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(volume_box), st->spotify_volume_image,
+                       FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(volume_box), st->spotify_volume_scale,
+                       FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(top_row), label_box, TRUE, TRUE, 0);
+    gtk_box_pack_end(GTK_BOX(top_row), volume_box, FALSE, FALSE, 0);
+
+    gtk_box_pack_start(GTK_BOX(text_box), top_row, FALSE, FALSE, 0);
     gtk_box_pack_start(GTK_BOX(text_box), st->spotify_progress,
                        FALSE, FALSE, 0);
 
