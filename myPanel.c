@@ -22,7 +22,7 @@
 #define WINDOW_Y 0
 #define ICON_SLOTS 4
 #define WEATHER_INTERVAL_SECONDS 600
-#define SPOTIFY_INTERVAL_SECONDS 2
+#define SPOTIFY_INTERVAL_SECONDS 1
 
 typedef struct {
     GtkWidget *window;
@@ -1513,22 +1513,13 @@ static void on_power_action_clicked(GtkButton *button, gpointer user_data) {
     (void)user_data;
     const char *cmd =
         (const char *)g_object_get_data(G_OBJECT(button), "power-command");
-    gpointer confirm_data =
-        g_object_get_data(G_OBJECT(button), "confirm-switch");
     gpointer dialog_data =
         g_object_get_data(G_OBJECT(button), "power-dialog");
-    GtkWidget *confirm_switch =
-        confirm_data ? GTK_WIDGET(confirm_data) : NULL;
     GtkWidget *dialog =
         dialog_data ? GTK_WIDGET(dialog_data) : NULL;
 
-    if (!cmd || !confirm_switch)
+    if (!cmd)
         return;
-
-    if (!gtk_switch_get_active(GTK_SWITCH(confirm_switch))) {
-        notify_user("myPanel", "Turn on the power confirmation switch first.");
-        return;
-    }
 
     GError *error = NULL;
     if (!g_spawn_command_line_async(cmd, &error)) {
@@ -1537,6 +1528,64 @@ static void on_power_action_clicked(GtkButton *button, gpointer user_data) {
         g_clear_error(&error);
         return;
     }
+
+    if (dialog)
+        gtk_dialog_response(GTK_DIALOG(dialog), GTK_RESPONSE_CLOSE);
+}
+
+static void update_shutdown_delay_label(GtkRange *range) {
+    gpointer label_data =
+        g_object_get_data(G_OBJECT(range), "shutdown-delay-label");
+    gpointer button_data =
+        g_object_get_data(G_OBJECT(range), "shutdown-button");
+    GtkWidget *label = label_data ? GTK_WIDGET(label_data) : NULL;
+    GtkWidget *button = button_data ? GTK_WIDGET(button_data) : NULL;
+    int minutes = (int)gtk_range_get_value(range);
+    char text[64];
+
+    if (minutes <= 0)
+        g_strlcpy(text, "shutdown: now", sizeof(text));
+    else
+        g_snprintf(text, sizeof(text), "shutdown: +%d min", minutes);
+
+    if (label)
+        gtk_label_set_text(GTK_LABEL(label), text);
+    if (button)
+        gtk_button_set_label(GTK_BUTTON(button), text);
+}
+
+static void on_shutdown_delay_changed(GtkRange *range, gpointer user_data) {
+    (void)user_data;
+    update_shutdown_delay_label(range);
+}
+
+static void on_shutdown_clicked(GtkButton *button, gpointer user_data) {
+    (void)user_data;
+    gpointer scale_data =
+        g_object_get_data(G_OBJECT(button), "shutdown-scale");
+    gpointer dialog_data =
+        g_object_get_data(G_OBJECT(button), "power-dialog");
+    GtkWidget *scale = scale_data ? GTK_WIDGET(scale_data) : NULL;
+    GtkWidget *dialog = dialog_data ? GTK_WIDGET(dialog_data) : NULL;
+
+    if (!scale)
+        return;
+
+    int minutes = (int)gtk_range_get_value(GTK_RANGE(scale));
+    gchar *cmd = minutes <= 0
+        ? g_strdup("shutdown now")
+        : g_strdup_printf("shutdown +%d", minutes);
+
+    GError *error = NULL;
+    if (!g_spawn_command_line_async(cmd, &error)) {
+        g_printerr("myPanel: shutdown command failed: %s\n",
+                   error ? error->message : "unknown error");
+        g_clear_error(&error);
+        g_free(cmd);
+        return;
+    }
+
+    g_free(cmd);
 
     if (dialog)
         gtk_dialog_response(GTK_DIALOG(dialog), GTK_RESPONSE_CLOSE);
@@ -1554,32 +1603,42 @@ static void on_power_clicked(GtkButton *button, gpointer user_data) {
     GtkWidget *content = gtk_dialog_get_content_area(GTK_DIALOG(dialog));
     GtkWidget *outer = gtk_box_new(GTK_ORIENTATION_VERTICAL, 6);
     GtkWidget *button_row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 4);
-    GtkWidget *confirm_row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
-    GtkWidget *confirm_label = gtk_label_new("confirm");
-    GtkWidget *confirm_switch = gtk_switch_new();
+    GtkWidget *shutdown_box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 5);
+    GtkWidget *shutdown_label = gtk_label_new("shutdown: now");
+    GtkWidget *shutdown_scale =
+        gtk_scale_new_with_range(GTK_ORIENTATION_HORIZONTAL, 0, 60, 1);
+    GtkWidget *shutdown_button = gtk_button_new_with_label("shutdown: now");
     const char *labels[] = {
-        "poweroff", "suspend", "hibernate", "shutdown"
+        "poweroff", "suspend", "hibernate"
     };
     const char *commands[] = {
         "systemctl poweroff",
         "systemctl suspend",
-        "systemctl hibernate",
-        "shutdown now"
+        "systemctl hibernate"
     };
 
     gtk_widget_set_name(outer, "power-menu");
-    gtk_widget_set_name(confirm_label, "confirm-label");
+    gtk_widget_set_name(shutdown_box, "shutdown-delay-box");
+    gtk_widget_set_name(shutdown_label, "power-caption");
+    gtk_widget_set_name(shutdown_scale, "shutdown-scale");
     gtk_container_set_border_width(GTK_CONTAINER(outer), 10);
-    gtk_label_set_xalign(GTK_LABEL(confirm_label), 0.0f);
-    gtk_widget_set_tooltip_text(confirm_switch,
-                                "Enable before running a power action");
+    gtk_label_set_xalign(GTK_LABEL(shutdown_label), 0.0f);
+    gtk_scale_set_draw_value(GTK_SCALE(shutdown_scale), TRUE);
+    gtk_scale_set_value_pos(GTK_SCALE(shutdown_scale), GTK_POS_RIGHT);
+    gtk_range_set_value(GTK_RANGE(shutdown_scale), 0);
+    gtk_range_set_increments(GTK_RANGE(shutdown_scale), 1, 10);
+    gtk_scale_add_mark(GTK_SCALE(shutdown_scale), 0, GTK_POS_BOTTOM, "0");
+    gtk_scale_add_mark(GTK_SCALE(shutdown_scale), 30, GTK_POS_BOTTOM, "30");
+    gtk_scale_add_mark(GTK_SCALE(shutdown_scale), 60, GTK_POS_BOTTOM, "60");
+    gtk_widget_set_tooltip_text(shutdown_scale,
+                                "Choose shutdown delay from 0 to 60 minutes");
+    gtk_widget_set_tooltip_text(shutdown_button,
+                                "Run shutdown now or shutdown +N minutes");
 
     for (size_t i = 0; i < G_N_ELEMENTS(labels); i++) {
         GtkWidget *action_button = gtk_button_new_with_label(labels[i]);
         g_object_set_data(G_OBJECT(action_button), "power-command",
                           (gpointer)commands[i]);
-        g_object_set_data(G_OBJECT(action_button), "confirm-switch",
-                          confirm_switch);
         g_object_set_data(G_OBJECT(action_button), "power-dialog", dialog);
         g_signal_connect(action_button, "clicked",
                          G_CALLBACK(on_power_action_clicked), NULL);
@@ -1587,12 +1646,30 @@ static void on_power_clicked(GtkButton *button, gpointer user_data) {
                            FALSE, FALSE, 0);
     }
 
-    gtk_box_pack_end(GTK_BOX(confirm_row), confirm_switch, FALSE, FALSE, 0);
-    gtk_box_pack_end(GTK_BOX(confirm_row), confirm_label, FALSE, FALSE, 0);
+    g_object_set_data(G_OBJECT(shutdown_scale), "shutdown-delay-label",
+                      shutdown_label);
+    g_object_set_data(G_OBJECT(shutdown_scale), "shutdown-button",
+                      shutdown_button);
+    g_object_set_data(G_OBJECT(shutdown_button), "shutdown-scale",
+                      shutdown_scale);
+    g_object_set_data(G_OBJECT(shutdown_button), "power-dialog", dialog);
+    g_signal_connect(shutdown_scale, "value-changed",
+                     G_CALLBACK(on_shutdown_delay_changed), NULL);
+    g_signal_connect(shutdown_button, "clicked",
+                     G_CALLBACK(on_shutdown_clicked), NULL);
+
+    gtk_box_pack_start(GTK_BOX(shutdown_box), shutdown_label,
+                       FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(shutdown_box), shutdown_scale,
+                       FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(shutdown_box), shutdown_button,
+                       FALSE, FALSE, 0);
+
     gtk_box_pack_start(GTK_BOX(outer), button_row, FALSE, FALSE, 0);
-    gtk_box_pack_start(GTK_BOX(outer), confirm_row, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(outer), shutdown_box, FALSE, FALSE, 0);
     gtk_box_pack_start(GTK_BOX(content), outer, TRUE, TRUE, 0);
 
+    update_shutdown_delay_label(GTK_RANGE(shutdown_scale));
     gtk_widget_show_all(dialog);
     gtk_dialog_run(GTK_DIALOG(dialog));
     gtk_widget_destroy(dialog);
@@ -1828,9 +1905,17 @@ static void apply_css(void) {
         "    rgba(255,255,255,0.94), rgba(220,228,238,0.84));"
         "  font: 700 10px Sans;"
         "}"
-        "#confirm-label {"
+        "#shutdown-delay-box {"
+        "  margin-top: 4px;"
+        "}"
+        "#power-caption {"
         "  color: rgba(255,255,255,0.88);"
         "  font: 10px Sans;"
+        "}"
+        "#shutdown-scale {"
+        "  min-width: 220px;"
+        "  color: rgba(255,255,255,0.82);"
+        "  font: 9px Sans;"
         "}";
 
     GtkCssProvider *provider = gtk_css_provider_new();

@@ -150,9 +150,10 @@ Open state:
   the compact media capsule manually.
 - Weather settings icon: opens a weather setup dialog and lets you paste a new
   API URL without editing files manually.
-- Power button: opens a separate dialog with `poweroff`, `suspend`,
-  `hibernate`, and `shutdown` controls. Turn on the confirmation switch before
-  a power action can run.
+- Power button: opens a separate dialog with immediate `poweroff`, `suspend`,
+  and `hibernate` controls. The `shutdown` action has a 0-60 minute delay
+  slider and runs `shutdown now` at 0 minutes or `shutdown +N` for a delayed
+  shutdown.
 
 ## Manual Build for Development
 
