@@ -22,6 +22,7 @@
 #define WINDOW_Y 0
 #define ICON_SLOTS 4
 #define WEATHER_INTERVAL_SECONDS 600
+#define SPOTIFY_INTERVAL_SECONDS 2
 
 typedef struct {
     GtkWidget *window;
@@ -31,10 +32,18 @@ typedef struct {
     GtkWidget *info_label;
     GtkWidget *weather_icon;
     GtkWidget *weather_label;
+    GtkWidget *spotify_now_box;
+    GtkWidget *spotify_now_icon;
+    GtkWidget *spotify_now_title_label;
+    GtkWidget *spotify_now_artist_label;
     GtkWidget *icon_buttons[ICON_SLOTS];
     GtkWidget *icon_images[ICON_SLOTS];
+    GtkWidget *spotify_button;
+    GtkWidget *spotify_image;
     GtkWidget *weather_reset_button;
     GtkWidget *weather_reset_image;
+    GtkWidget *power_button;
+    GtkWidget *power_image;
 
     char config_path[PATH_MAX];
     char time_line[64];
@@ -53,6 +62,13 @@ typedef struct {
     char weather_url[1024];
     gboolean weather_inflight;
 
+    GDBusConnection *session_bus;
+    char spotify_status[32];
+    char spotify_title[160];
+    char spotify_artist[160];
+    char spotify_album[160];
+    gboolean spotify_available;
+
     char icon_names[ICON_SLOTS][PATH_MAX];
     char icon_commands[ICON_SLOTS][PATH_MAX];
     char icon_tooltips[ICON_SLOTS][128];
@@ -64,6 +80,7 @@ typedef struct {
 static GtkWidget *make_label(const char *name, const char *text);
 static GtkWidget *make_entry(const char *name, const char *placeholder,
                              const char *value);
+static void queue_input_region_update(AppState *st);
 
 static gboolean read_first_line(const char *path, char *buf, size_t len) {
     FILE *fp = fopen(path, "r");
@@ -721,6 +738,215 @@ static gboolean update_weather(gpointer data) {
     return G_SOURCE_CONTINUE;
 }
 
+static gboolean dbus_name_has_owner(AppState *st, const char *name) {
+    if (!st->session_bus)
+        return FALSE;
+
+    GError *error = NULL;
+    GVariant *result = g_dbus_connection_call_sync(
+        st->session_bus,
+        "org.freedesktop.DBus",
+        "/org/freedesktop/DBus",
+        "org.freedesktop.DBus",
+        "NameHasOwner",
+        g_variant_new("(s)", name),
+        G_VARIANT_TYPE("(b)"),
+        G_DBUS_CALL_FLAGS_NONE,
+        300,
+        NULL,
+        &error);
+
+    if (!result) {
+        g_clear_error(&error);
+        return FALSE;
+    }
+
+    gboolean has_owner = FALSE;
+    g_variant_get(result, "(b)", &has_owner);
+    g_variant_unref(result);
+    return has_owner;
+}
+
+static GVariant *dbus_get_property(AppState *st, const char *bus_name,
+                                   const char *path,
+                                   const char *interface,
+                                   const char *property) {
+    if (!st->session_bus)
+        return NULL;
+
+    GError *error = NULL;
+    GVariant *result = g_dbus_connection_call_sync(
+        st->session_bus,
+        bus_name,
+        path,
+        "org.freedesktop.DBus.Properties",
+        "Get",
+        g_variant_new("(ss)", interface, property),
+        G_VARIANT_TYPE("(v)"),
+        G_DBUS_CALL_FLAGS_NONE,
+        300,
+        NULL,
+        &error);
+
+    if (!result) {
+        g_clear_error(&error);
+        return NULL;
+    }
+
+    GVariant *boxed = g_variant_get_child_value(result, 0);
+    GVariant *value = g_variant_get_variant(boxed);
+    g_variant_unref(boxed);
+    g_variant_unref(result);
+    return value;
+}
+
+static void copy_metadata_string(GVariant *metadata, const char *key,
+                                 char *dest, size_t len) {
+    dest[0] = '\0';
+    if (!metadata)
+        return;
+
+    GVariant *value =
+        g_variant_lookup_value(metadata, key, G_VARIANT_TYPE_STRING);
+    if (!value)
+        return;
+
+    g_strlcpy(dest, g_variant_get_string(value, NULL), len);
+    g_variant_unref(value);
+}
+
+static void copy_metadata_first_string(GVariant *metadata, const char *key,
+                                       char *dest, size_t len) {
+    dest[0] = '\0';
+    if (!metadata)
+        return;
+
+    GVariant *value =
+        g_variant_lookup_value(metadata, key, G_VARIANT_TYPE("as"));
+    if (!value)
+        return;
+
+    if (g_variant_n_children(value) > 0) {
+        GVariant *child = g_variant_get_child_value(value, 0);
+        g_strlcpy(dest, g_variant_get_string(child, NULL), len);
+        g_variant_unref(child);
+    }
+
+    g_variant_unref(value);
+}
+
+static void refresh_spotify_now_widgets(AppState *st) {
+    if (!st->spotify_now_title_label || !st->spotify_now_artist_label)
+        return;
+
+    char title[224];
+    char subtitle[256];
+    const char *status = "spotify";
+
+    if (!st->spotify_available) {
+        gtk_label_set_text(GTK_LABEL(st->spotify_now_title_label),
+                           "spotify: not running");
+        gtk_label_set_text(GTK_LABEL(st->spotify_now_artist_label),
+                           "press the Spotify icon to launch");
+        return;
+    }
+
+    if (strcmp(st->spotify_status, "Playing") == 0)
+        status = "playing";
+    else if (strcmp(st->spotify_status, "Paused") == 0)
+        status = "paused";
+    else if (strcmp(st->spotify_status, "Stopped") == 0)
+        status = "stopped";
+
+    if (st->spotify_title[0] != '\0') {
+        g_snprintf(title, sizeof(title), "%s: %s",
+                   status, st->spotify_title);
+    } else {
+        g_snprintf(title, sizeof(title), "%s: Spotify", status);
+    }
+
+    if (st->spotify_artist[0] != '\0' && st->spotify_album[0] != '\0') {
+        g_snprintf(subtitle, sizeof(subtitle), "%s - %s",
+                   st->spotify_artist, st->spotify_album);
+    } else if (st->spotify_artist[0] != '\0') {
+        g_strlcpy(subtitle, st->spotify_artist, sizeof(subtitle));
+    } else if (st->spotify_album[0] != '\0') {
+        g_strlcpy(subtitle, st->spotify_album, sizeof(subtitle));
+    } else {
+        g_strlcpy(subtitle, "Spotify", sizeof(subtitle));
+    }
+
+    gtk_label_set_text(GTK_LABEL(st->spotify_now_title_label), title);
+    gtk_label_set_text(GTK_LABEL(st->spotify_now_artist_label), subtitle);
+}
+
+static gboolean update_spotify_now(gpointer data) {
+    AppState *st = (AppState *)data;
+
+    if (!st->session_bus) {
+        GError *error = NULL;
+        st->session_bus = g_bus_get_sync(G_BUS_TYPE_SESSION, NULL, &error);
+        if (!st->session_bus) {
+            g_clear_error(&error);
+            st->spotify_available = FALSE;
+            refresh_spotify_now_widgets(st);
+            return G_SOURCE_CONTINUE;
+        }
+    }
+
+    if (!dbus_name_has_owner(st, "org.mpris.MediaPlayer2.spotify")) {
+        st->spotify_available = FALSE;
+        st->spotify_status[0] = '\0';
+        st->spotify_title[0] = '\0';
+        st->spotify_artist[0] = '\0';
+        st->spotify_album[0] = '\0';
+        refresh_spotify_now_widgets(st);
+        return G_SOURCE_CONTINUE;
+    }
+
+    GVariant *status = dbus_get_property(
+        st,
+        "org.mpris.MediaPlayer2.spotify",
+        "/org/mpris/MediaPlayer2",
+        "org.mpris.MediaPlayer2.Player",
+        "PlaybackStatus");
+    GVariant *metadata = dbus_get_property(
+        st,
+        "org.mpris.MediaPlayer2.spotify",
+        "/org/mpris/MediaPlayer2",
+        "org.mpris.MediaPlayer2.Player",
+        "Metadata");
+
+    st->spotify_available = TRUE;
+    st->spotify_status[0] = '\0';
+    st->spotify_title[0] = '\0';
+    st->spotify_artist[0] = '\0';
+    st->spotify_album[0] = '\0';
+
+    if (status) {
+        g_strlcpy(st->spotify_status,
+                  g_variant_get_string(status, NULL),
+                  sizeof(st->spotify_status));
+        g_variant_unref(status);
+    }
+
+    if (metadata) {
+        copy_metadata_string(metadata, "xesam:title",
+                             st->spotify_title,
+                             sizeof(st->spotify_title));
+        copy_metadata_first_string(metadata, "xesam:artist",
+                                   st->spotify_artist,
+                                   sizeof(st->spotify_artist));
+        copy_metadata_string(metadata, "xesam:album",
+                             st->spotify_album,
+                             sizeof(st->spotify_album));
+        g_variant_unref(metadata);
+    }
+
+    refresh_spotify_now_widgets(st);
+    return G_SOURCE_CONTINUE;
+}
+
 static gboolean update_time_cb(gpointer data) {
     AppState *st = (AppState *)data;
     format_current_time(st);
@@ -773,10 +999,13 @@ static gboolean apply_input_region_cb(gpointer data) {
     add_widget_region(st->window, st->menu_button, region, 4);
 
     if (st->expanded) {
-        for (int i = 0; i < ICON_SLOTS; i++)
-            add_widget_region(st->window, st->icon_buttons[i], region, 2);
-
+        add_widget_region(st->window, st->power_button, region, 2);
+        add_widget_region(st->window, st->icon_buttons[0], region, 2);
+        add_widget_region(st->window, st->icon_buttons[1], region, 2);
+        add_widget_region(st->window, st->spotify_button, region, 2);
+        add_widget_region(st->window, st->icon_buttons[2], region, 2);
         add_widget_region(st->window, st->weather_reset_button, region, 2);
+        add_widget_region(st->window, st->icon_buttons[3], region, 2);
     }
 
     gtk_widget_input_shape_combine_region(st->window, region);
@@ -813,6 +1042,7 @@ static void set_expanded(AppState *st, gboolean expanded) {
 
     gtk_window_resize(GTK_WINDOW(st->window), 1, 1);
     queue_input_region_update(st);
+    g_timeout_add(150, apply_input_region_cb, st);
 }
 
 static void on_menu_clicked(GtkButton *button, gpointer user_data) {
@@ -874,6 +1104,188 @@ static void on_weather_reset_clicked(GtkButton *button, gpointer user_data) {
                            gtk_entry_get_text(GTK_ENTRY(url_entry)));
     }
 
+    gtk_widget_destroy(dialog);
+}
+
+static gboolean spawn_argv_async(const gchar *const *argv,
+                                 const char *error_context) {
+    GError *error = NULL;
+    gboolean ok = g_spawn_async(NULL,
+                                (gchar **)argv,
+                                NULL,
+                                G_SPAWN_SEARCH_PATH,
+                                NULL,
+                                NULL,
+                                NULL,
+                                &error);
+
+    if (!ok) {
+        g_printerr("myPanel: %s failed: %s\n",
+                   error_context,
+                   error ? error->message : "unknown error");
+        g_clear_error(&error);
+    }
+
+    return ok;
+}
+
+static void notify_user(const char *summary, const char *body) {
+    gchar *notify = g_find_program_in_path("notify-send");
+    if (!notify)
+        return;
+
+    const gchar *argv[] = {
+        notify, summary, body, NULL
+    };
+    spawn_argv_async(argv, "notification");
+    g_free(notify);
+}
+
+static void launch_spotify(void) {
+    gchar *local_spotify = g_build_filename(g_get_home_dir(),
+                                            ".local/bin/spotify",
+                                            NULL);
+    gchar *spotify = NULL;
+    gchar *spotify_launcher = g_find_program_in_path("spotify-launcher");
+
+    if (g_file_test(local_spotify, G_FILE_TEST_IS_EXECUTABLE))
+        spotify = g_strdup(local_spotify);
+    else
+        spotify = g_find_program_in_path("spotify");
+
+    g_free(local_spotify);
+
+    if (spotify) {
+        const gchar *argv[] = { spotify, NULL };
+        spawn_argv_async(argv, "spotify");
+        g_free(spotify_launcher);
+        g_free(spotify);
+        return;
+    }
+
+    if (spotify_launcher) {
+        const gchar *argv[] = { spotify_launcher, NULL };
+        spawn_argv_async(argv, "spotify-launcher");
+        g_free(spotify);
+        g_free(spotify_launcher);
+        return;
+    }
+
+    g_free(spotify_launcher);
+    g_free(spotify);
+
+    gchar *pkexec = g_find_program_in_path("pkexec");
+    gchar *pacman = g_find_program_in_path("pacman");
+    if (pkexec && pacman) {
+        notify_user("myPanel",
+                    "Spotify is not installed. Requesting spotify-launcher installation.");
+        const gchar *argv[] = {
+            "sh", "-lc",
+            "pkexec pacman -S --needed spotify-launcher playerctl && setsid -f spotify-launcher",
+            NULL
+        };
+        spawn_argv_async(argv, "spotify installer");
+    } else {
+        notify_user("myPanel",
+                    "Install spotify-launcher and playerctl, then press Spotify again.");
+    }
+
+    g_free(pkexec);
+    g_free(pacman);
+}
+
+static void on_spotify_clicked(GtkButton *button, gpointer user_data) {
+    (void)button;
+    (void)user_data;
+    launch_spotify();
+}
+
+static void on_power_action_clicked(GtkButton *button, gpointer user_data) {
+    (void)user_data;
+    const char *cmd =
+        (const char *)g_object_get_data(G_OBJECT(button), "power-command");
+    gpointer confirm_data =
+        g_object_get_data(G_OBJECT(button), "confirm-switch");
+    gpointer dialog_data =
+        g_object_get_data(G_OBJECT(button), "power-dialog");
+    GtkWidget *confirm_switch =
+        confirm_data ? GTK_WIDGET(confirm_data) : NULL;
+    GtkWidget *dialog =
+        dialog_data ? GTK_WIDGET(dialog_data) : NULL;
+
+    if (!cmd || !confirm_switch)
+        return;
+
+    if (!gtk_switch_get_active(GTK_SWITCH(confirm_switch))) {
+        notify_user("myPanel", "Turn on the power confirmation switch first.");
+        return;
+    }
+
+    GError *error = NULL;
+    if (!g_spawn_command_line_async(cmd, &error)) {
+        g_printerr("myPanel: power command failed: %s\n",
+                   error ? error->message : "unknown error");
+        g_clear_error(&error);
+        return;
+    }
+
+    if (dialog)
+        gtk_dialog_response(GTK_DIALOG(dialog), GTK_RESPONSE_CLOSE);
+}
+
+static void on_power_clicked(GtkButton *button, gpointer user_data) {
+    (void)button;
+    AppState *st = (AppState *)user_data;
+    GtkWidget *dialog = gtk_dialog_new_with_buttons(
+        "Power",
+        GTK_WINDOW(st->window),
+        GTK_DIALOG_MODAL | GTK_DIALOG_DESTROY_WITH_PARENT,
+        "_Close", GTK_RESPONSE_CLOSE,
+        NULL);
+    GtkWidget *content = gtk_dialog_get_content_area(GTK_DIALOG(dialog));
+    GtkWidget *outer = gtk_box_new(GTK_ORIENTATION_VERTICAL, 6);
+    GtkWidget *button_row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 4);
+    GtkWidget *confirm_row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
+    GtkWidget *confirm_label = gtk_label_new("confirm");
+    GtkWidget *confirm_switch = gtk_switch_new();
+    const char *labels[] = {
+        "poweroff", "suspend", "hibernate", "shutdown"
+    };
+    const char *commands[] = {
+        "systemctl poweroff",
+        "systemctl suspend",
+        "systemctl hibernate",
+        "shutdown now"
+    };
+
+    gtk_widget_set_name(outer, "power-menu");
+    gtk_widget_set_name(confirm_label, "confirm-label");
+    gtk_container_set_border_width(GTK_CONTAINER(outer), 10);
+    gtk_label_set_xalign(GTK_LABEL(confirm_label), 0.0f);
+    gtk_widget_set_tooltip_text(confirm_switch,
+                                "Enable before running a power action");
+
+    for (size_t i = 0; i < G_N_ELEMENTS(labels); i++) {
+        GtkWidget *action_button = gtk_button_new_with_label(labels[i]);
+        g_object_set_data(G_OBJECT(action_button), "power-command",
+                          (gpointer)commands[i]);
+        g_object_set_data(G_OBJECT(action_button), "confirm-switch",
+                          confirm_switch);
+        g_object_set_data(G_OBJECT(action_button), "power-dialog", dialog);
+        g_signal_connect(action_button, "clicked",
+                         G_CALLBACK(on_power_action_clicked), NULL);
+        gtk_box_pack_start(GTK_BOX(button_row), action_button,
+                           FALSE, FALSE, 0);
+    }
+
+    gtk_box_pack_end(GTK_BOX(confirm_row), confirm_switch, FALSE, FALSE, 0);
+    gtk_box_pack_end(GTK_BOX(confirm_row), confirm_label, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(outer), button_row, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(outer), confirm_row, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(content), outer, TRUE, TRUE, 0);
+
+    gtk_widget_show_all(dialog);
+    gtk_dialog_run(GTK_DIALOG(dialog));
     gtk_widget_destroy(dialog);
 }
 
@@ -948,6 +1360,24 @@ static GtkWidget *make_entry(const char *name, const char *placeholder,
     return entry;
 }
 
+static void image_set_best_icon(GtkWidget *image,
+                                const char *const *icons,
+                                const char *fallback) {
+    GtkIconTheme *theme = gtk_icon_theme_get_default();
+    const char *icon_name = fallback;
+
+    for (int i = 0; icons[i] != NULL; i++) {
+        if (gtk_icon_theme_has_icon(theme, icons[i])) {
+            icon_name = icons[i];
+            break;
+        }
+    }
+
+    gtk_image_set_from_icon_name(GTK_IMAGE(image),
+                                 icon_name,
+                                 GTK_ICON_SIZE_LARGE_TOOLBAR);
+}
+
 static void apply_css(void) {
     static const char *css =
         "window, #rootbox {"
@@ -996,6 +1426,16 @@ static void apply_css(void) {
         "  font: 11px Sans;"
         "  text-shadow: 0 1px rgba(0,0,0,0.70);"
         "}"
+        "#now-title {"
+        "  color: #ffffff;"
+        "  font: 700 11px Sans;"
+        "  text-shadow: 0 1px rgba(0,0,0,0.70);"
+        "}"
+        "#now-subtitle {"
+        "  color: rgba(255,255,255,0.82);"
+        "  font: 10px Sans;"
+        "  text-shadow: 0 1px rgba(0,0,0,0.64);"
+        "}"
         "#glass-entry {"
         "  min-height: 22px;"
         "  border-radius: 6px;"
@@ -1021,6 +1461,27 @@ static void apply_css(void) {
         "  border: 1px solid rgba(255,255,255,0.38);"
         "  background-color: rgba(255,255,255,0.12);"
         "  box-shadow: inset 0 1px rgba(255,255,255,0.26);"
+        "}"
+        "#power-menu {"
+        "  margin-top: 4px;"
+        "  padding: 6px;"
+        "  border-radius: 8px;"
+        "  border: 1px solid rgba(255,255,255,0.34);"
+        "  background-color: rgba(8,12,16,0.30);"
+        "}"
+        "#power-menu button {"
+        "  min-height: 24px;"
+        "  border-radius: 6px;"
+        "  border: 1px solid rgba(255,255,255,0.34);"
+        "  color: #16202b;"
+        "  text-shadow: none;"
+        "  background-image: linear-gradient(to bottom,"
+        "    rgba(255,255,255,0.94), rgba(220,228,238,0.84));"
+        "  font: 700 10px Sans;"
+        "}"
+        "#confirm-label {"
+        "  color: rgba(255,255,255,0.88);"
+        "  font: 10px Sans;"
         "}";
 
     GtkCssProvider *provider = gtk_css_provider_new();
@@ -1038,7 +1499,7 @@ static GtkWidget *build_weather_box(AppState *st) {
     GtkWidget *outer = gtk_box_new(GTK_ORIENTATION_VERTICAL, 5);
     GtkWidget *top = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
 
-    gtk_box_pack_start(GTK_BOX(outer), make_label("section-label", "weather api"),
+    gtk_box_pack_start(GTK_BOX(outer), make_label("section-label", "weather"),
                        FALSE, FALSE, 0);
 
     st->weather_icon = gtk_image_new_from_icon_name(st->weather_icon_name,
@@ -1051,6 +1512,49 @@ static GtkWidget *build_weather_box(AppState *st) {
     gtk_box_pack_start(GTK_BOX(top), st->weather_label, TRUE, TRUE, 0);
     gtk_box_pack_start(GTK_BOX(outer), top, FALSE, FALSE, 0);
 
+    return outer;
+}
+
+static GtkWidget *build_spotify_now_box(AppState *st) {
+    GtkWidget *outer = gtk_box_new(GTK_ORIENTATION_VERTICAL, 5);
+    GtkWidget *row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
+    GtkWidget *text_box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 1);
+    const char *spotify_icons[] = {
+        "spotify",
+        "spotify-client",
+        "com.spotify.Client",
+        "spotify-launcher",
+        NULL
+    };
+
+    gtk_box_pack_start(GTK_BOX(outer), make_label("section-label", "now playing"),
+                       FALSE, FALSE, 0);
+
+    st->spotify_now_icon = gtk_image_new();
+    image_set_best_icon(st->spotify_now_icon, spotify_icons,
+                        "multimedia-player");
+    st->spotify_now_title_label =
+        make_label("now-title", "spotify: not running");
+    st->spotify_now_artist_label =
+        make_label("now-subtitle", "press the Spotify icon to launch");
+
+    gtk_label_set_ellipsize(GTK_LABEL(st->spotify_now_title_label),
+                            PANGO_ELLIPSIZE_END);
+    gtk_label_set_ellipsize(GTK_LABEL(st->spotify_now_artist_label),
+                            PANGO_ELLIPSIZE_END);
+    gtk_widget_set_size_request(st->spotify_now_title_label, 260, -1);
+    gtk_widget_set_size_request(st->spotify_now_artist_label, 260, -1);
+
+    gtk_box_pack_start(GTK_BOX(text_box), st->spotify_now_title_label,
+                       FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(text_box), st->spotify_now_artist_label,
+                       FALSE, FALSE, 0);
+
+    gtk_box_pack_start(GTK_BOX(row), st->spotify_now_icon, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(row), text_box, TRUE, TRUE, 0);
+    gtk_box_pack_start(GTK_BOX(outer), row, FALSE, FALSE, 0);
+
+    st->spotify_now_box = outer;
     return outer;
 }
 
@@ -1072,9 +1576,26 @@ static GtkWidget *build_icon_box(AppState *st) {
                           GINT_TO_POINTER(i));
         g_signal_connect(st->icon_buttons[i], "clicked",
                          G_CALLBACK(on_icon_clicked), st);
-        gtk_box_pack_start(GTK_BOX(row), st->icon_buttons[i],
-                           FALSE, FALSE, 0);
     }
+
+    st->spotify_image = gtk_image_new();
+    const char *spotify_icons[] = {
+        "spotify",
+        "spotify-client",
+        "com.spotify.Client",
+        "spotify-launcher",
+        NULL
+    };
+    image_set_best_icon(st->spotify_image, spotify_icons,
+                        "multimedia-player");
+    st->spotify_button = gtk_button_new();
+    gtk_widget_set_name(st->spotify_button, "icon-button");
+    gtk_button_set_image(GTK_BUTTON(st->spotify_button), st->spotify_image);
+    gtk_button_set_always_show_image(GTK_BUTTON(st->spotify_button), TRUE);
+    gtk_widget_set_tooltip_text(st->spotify_button,
+                                "Spotify native app");
+    g_signal_connect(st->spotify_button, "clicked",
+                     G_CALLBACK(on_spotify_clicked), st);
 
     st->weather_reset_image =
         gtk_image_new_from_icon_name("weather-clear",
@@ -1089,7 +1610,18 @@ static GtkWidget *build_icon_box(AppState *st) {
                                 "Reset weather API URL");
     g_signal_connect(st->weather_reset_button, "clicked",
                      G_CALLBACK(on_weather_reset_clicked), st);
+
+    gtk_box_pack_start(GTK_BOX(row), st->icon_buttons[0],
+                       FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(row), st->icon_buttons[1],
+                       FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(row), st->spotify_button,
+                       FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(row), st->icon_buttons[2],
+                       FALSE, FALSE, 0);
     gtk_box_pack_start(GTK_BOX(row), st->weather_reset_button,
+                       FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(row), st->icon_buttons[3],
                        FALSE, FALSE, 0);
 
     gtk_box_pack_start(GTK_BOX(outer), row, FALSE, FALSE, 0);
@@ -1113,6 +1645,8 @@ static GtkWidget *build_ui(AppState *st) {
     gtk_widget_set_name(st->details_box, "glass-panel");
     gtk_widget_set_no_show_all(st->details_box, TRUE);
 
+    GtkWidget *top_row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
+
     st->info_label = gtk_label_new("");
     gtk_widget_set_name(st->info_label, "info-label");
     gtk_label_set_xalign(GTK_LABEL(st->info_label), 0.0f);
@@ -1120,9 +1654,31 @@ static GtkWidget *build_ui(AppState *st) {
     gtk_label_set_justify(GTK_LABEL(st->info_label), GTK_JUSTIFY_LEFT);
     gtk_label_set_selectable(GTK_LABEL(st->info_label), FALSE);
 
-    gtk_box_pack_start(GTK_BOX(st->details_box), st->info_label,
+    st->power_image = gtk_image_new();
+    const char *power_icons[] = {
+        "system-shutdown",
+        "application-exit",
+        NULL
+    };
+    image_set_best_icon(st->power_image, power_icons, "application-exit");
+    st->power_button = gtk_button_new();
+    gtk_widget_set_name(st->power_button, "icon-button");
+    gtk_button_set_image(GTK_BUTTON(st->power_button), st->power_image);
+    gtk_button_set_always_show_image(GTK_BUTTON(st->power_button), TRUE);
+    gtk_widget_set_tooltip_text(st->power_button, "Power menu");
+    g_signal_connect(st->power_button, "clicked",
+                     G_CALLBACK(on_power_clicked), st);
+
+    gtk_box_pack_start(GTK_BOX(top_row), st->info_label,
+                       TRUE, TRUE, 0);
+    gtk_box_pack_end(GTK_BOX(top_row), st->power_button,
+                     FALSE, FALSE, 0);
+
+    gtk_box_pack_start(GTK_BOX(st->details_box), top_row,
                        FALSE, FALSE, 0);
     gtk_box_pack_start(GTK_BOX(st->details_box), build_weather_box(st),
+                       FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(st->details_box), build_spotify_now_box(st),
                        FALSE, FALSE, 0);
     gtk_box_pack_start(GTK_BOX(st->details_box), build_icon_box(st),
                        FALSE, FALSE, 0);
@@ -1178,17 +1734,22 @@ int main(int argc, char **argv) {
     format_battery(&st);
     refresh_info_label(&st);
     refresh_weather_widgets(&st);
+    refresh_spotify_now_widgets(&st);
 
     g_timeout_add(1000, update_time_cb, &st);
     g_timeout_add_seconds(10, update_slow_cb, &st);
     g_timeout_add_seconds(5, update_net, &st);
     g_timeout_add_seconds(WEATHER_INTERVAL_SECONDS, update_weather, &st);
+    g_timeout_add_seconds(SPOTIFY_INTERVAL_SECONDS, update_spotify_now, &st);
 
     gtk_widget_show_all(st.window);
     set_expanded(&st, FALSE);
     update_net(&st);
     update_weather(&st);
+    update_spotify_now(&st);
 
     gtk_main();
+    if (st.session_bus)
+        g_object_unref(st.session_bus);
     return 0;
 }

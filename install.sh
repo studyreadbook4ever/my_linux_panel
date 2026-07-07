@@ -3,6 +3,7 @@ set -euo pipefail
 
 APP_NAME="myPanel"
 INSTALL_PATH="/usr/local/bin/myPanel"
+SPOTIFY_FOCUS_PATH="/usr/local/bin/myPanel-spotify-focus"
 AUTOSTART_NAME="mypanel.desktop"
 DEFAULT_WEATHER_PLACE="Seoul"
 DEFAULT_WEATHER_URL="https://api.open-meteo.com/v1/forecast?latitude=37.5665&longitude=126.9780&current=temperature_2m,weather_code&timezone=auto"
@@ -11,11 +12,18 @@ REQUIRED_PACKAGES=(
   gtk3
   pkgconf
   curl
+  alsa-plugins
   exo
   xfce4-settings
   xfwm4
   xfconf
   clang
+  libx11
+  pulseaudio
+  pulseaudio-alsa
+  spotify-launcher
+  playerctl
+  libnotify
 )
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
@@ -351,6 +359,199 @@ build_panel() {
   install -m 0755 "$BUILD_DIR/myPanel" "$INSTALL_PATH"
 }
 
+install_spotify_helpers() {
+  local compiler
+  local local_bin="$TARGET_HOME/.local/bin"
+  local spotify_wrapper="$local_bin/spotify"
+  local playerctl_wrapper="$local_bin/playerctl"
+
+  if command -v clang >/dev/null 2>&1; then
+    compiler="clang"
+  elif command -v gcc >/dev/null 2>&1; then
+    compiler="gcc"
+  else
+    die "No C compiler found. Install clang or gcc."
+  fi
+
+  [[ -f "$SCRIPT_DIR/tools/spotify-window-activate.c" ]] || \
+    die "Missing tools/spotify-window-activate.c"
+
+  info "Building Spotify focus helper with $compiler"
+  "$compiler" -O2 -pipe "$SCRIPT_DIR/tools/spotify-window-activate.c" \
+    -o "$BUILD_DIR/myPanel-spotify-focus" -lX11
+  install -m 0755 "$BUILD_DIR/myPanel-spotify-focus" "$SPOTIFY_FOCUS_PATH"
+
+  install -d -m 0755 -o "$TARGET_USER" -g "$TARGET_GROUP" "$local_bin"
+
+  cat > "$BUILD_DIR/spotify" <<EOF
+#!/usr/bin/env sh
+set -eu
+
+focus_helper="\${SPOTIFY_FOCUS_HELPER:-$SPOTIFY_FOCUS_PATH}"
+launcher="\${SPOTIFY_LAUNCHER:-}"
+log_file="\${XDG_CACHE_HOME:-\$HOME/.cache}/spotify-launcher-wrapper.log"
+pipewire_remote="\${SPOTIFY_PIPEWIRE_REMOTE:-myPanel-disabled}"
+
+if [ -z "\$launcher" ]; then
+  launcher="\$(command -v spotify-launcher || true)"
+fi
+
+mkdir -p "\$(dirname "\$log_file")"
+printf '[%s] spotify wrapper invoked: %s\n' "\$(date -Is)" "\$*" >>"\$log_file"
+
+focus_spotify() {
+  [ -x "\$focus_helper" ] && "\$focus_helper" >/dev/null 2>&1
+}
+
+if [ "\$#" -eq 0 ] && focus_spotify; then
+  exit 0
+fi
+
+if [ -z "\$launcher" ]; then
+  printf '%s\n' "spotify: spotify-launcher is not installed" >&2
+  exit 127
+fi
+
+PIPEWIRE_REMOTE="\$pipewire_remote" setsid -f "\$launcher" "\$@" >>"\$log_file" 2>&1 || true
+
+i=0
+while [ "\$i" -lt 30 ]; do
+  if focus_spotify; then
+    exit 0
+  fi
+  i=\$((i + 1))
+  sleep 0.2
+done
+
+exit 0
+EOF
+
+  install -m 0755 -o "$TARGET_USER" -g "$TARGET_GROUP" \
+    "$BUILD_DIR/spotify" "$spotify_wrapper"
+
+  if [[ ! -x /usr/bin/playerctl ]]; then
+    cat > "$BUILD_DIR/playerctl" <<'EOF'
+#!/usr/bin/env sh
+set -eu
+
+if [ -x /usr/bin/playerctl ]; then
+  exec /usr/bin/playerctl "$@"
+fi
+
+service="${PLAYERCTL_PLAYER:-org.mpris.MediaPlayer2.spotify}"
+path="/org/mpris/MediaPlayer2"
+iface="org.mpris.MediaPlayer2.Player"
+
+usage() {
+  cat >&2 <<'TEXT'
+playerctl fallback for Spotify is installed locally.
+Supported commands: -l, play, pause, play-pause, next, previous, stop, status, metadata
+Install the full package for every playerctl feature: sudo pacman -S --needed playerctl
+TEXT
+}
+
+call_method() {
+  busctl --user call "$service" "$path" "$iface" "$1" >/dev/null
+}
+
+get_property() {
+  busctl --user get-property "$service" "$path" "$iface" "$1"
+}
+
+metadata_value() {
+  key="$1"
+  get_property Metadata | tr '"' '\n' | awk -v key="$key" '
+    $0 == key { getline; getline; print; exit }
+  '
+}
+
+player_present() {
+  busctl --user list 2>/dev/null | grep -q "org.mpris.MediaPlayer2.spotify"
+}
+
+player_identity() {
+  busctl --user get-property "$service" /org/mpris/MediaPlayer2 \
+    org.mpris.MediaPlayer2 Identity 2>/dev/null |
+    sed -E 's/^s "(.*)"$/\1/'
+}
+
+playback_status() {
+  get_property PlaybackStatus 2>/dev/null | sed -E 's/^s "(.*)"$/\1/'
+}
+
+cmd="${1:-}"
+case "$cmd" in
+  -l|--list-all)
+    if player_present; then
+      printf '%s\n' spotify
+    fi
+    ;;
+  play)
+    call_method Play
+    ;;
+  pause)
+    call_method Pause
+    ;;
+  play-pause|playpause)
+    call_method PlayPause
+    ;;
+  next)
+    call_method Next
+    ;;
+  previous)
+    call_method Previous
+    ;;
+  stop)
+    call_method Stop
+    ;;
+  status)
+    playback_status
+    ;;
+  metadata)
+    if [ "${2:-}" = "--format" ] && [ -n "${3:-}" ]; then
+      player_name="$(player_identity || true)"
+      status="$(playback_status || true)"
+      artist="$(metadata_value xesam:artist || true)"
+      title="$(metadata_value xesam:title || true)"
+      album="$(metadata_value xesam:album || true)"
+      printf '%s\n' "$3" |
+        awk \
+          -v playerName="$player_name" \
+          -v status="$status" \
+          -v artist="$artist" \
+          -v title="$title" \
+          -v album="$album" '
+            {
+              gsub(/\{\{[ ]*playerName[ ]*\}\}/, playerName)
+              gsub(/\{\{[ ]*status[ ]*\}\}/, status)
+              gsub(/\{\{[ ]*artist[ ]*\}\}/, artist)
+              gsub(/\{\{[ ]*title[ ]*\}\}/, title)
+              gsub(/\{\{[ ]*album[ ]*\}\}/, album)
+              print
+            }
+          '
+    elif [ -n "${2:-}" ]; then
+      metadata_value "$2"
+    else
+      get_property Metadata
+    fi
+    ;;
+  -h|--help|"")
+    usage
+    [ -n "$cmd" ]
+    ;;
+  *)
+    usage
+    exit 2
+    ;;
+esac
+EOF
+
+    install -m 0755 -o "$TARGET_USER" -g "$TARGET_GROUP" \
+      "$BUILD_DIR/playerctl" "$playerctl_wrapper"
+  fi
+}
+
 try_enable_compositor() {
   if ! command -v xfconf-query >/dev/null 2>&1; then
     return 0
@@ -421,6 +622,7 @@ TEXT
   install_packages
   choose_weather
   build_panel
+  install_spotify_helpers
   write_panel_config "$TARGET_HOME/.config/myPanel"
   write_autostart
   try_enable_compositor

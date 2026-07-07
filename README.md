@@ -7,14 +7,15 @@
 + Xfce4 on X11.(recommand for 'only Xfce4')
 
 It starts as one small `menu` button in the top-left corner. Pressing `menu`
-opens a glass panel with system status text, weather, four user shortcut icons,
-and a fifth fixed weather-reset icon.
+opens a glass panel with system status text, weather, Spotify now playing,
+native Spotify launch, shortcut icons, a weather-reset icon, settings, and a
+guarded power dialog.
 
 The glass area is click-through on X11. Only these widgets catch clicks:
 
 - `menu` / `close`
-- four user shortcut icons
-- the fifth weather API reset icon
+- the top-right power button
+- shell, internet, Spotify, file, weather settings, and settings icons
 
 ## Quick Install on Arch Linux + Xfce4
 
@@ -47,7 +48,15 @@ desktop does not look like Xfce.
 6. Creates `~/.config/myPanel/panel.ini` for the real desktop user.
 7. Creates `~/.config/autostart/mypanel.desktop` for Xfce login startup.
 8. Tries to enable the Xfce compositor for real transparency.
-9. Offers to start or restart the panel immediately.
+9. Installs `spotify-launcher`, `playerctl`, `libnotify`, and the PulseAudio
+   ALSA bridge packages so the Spotify button can use the native desktop client
+   and MPRIS-friendly Linux media stack.
+10. Builds a tiny X11 Spotify focus helper and writes a `~/.local/bin/spotify`
+    wrapper for the desktop user. The wrapper focuses an existing Spotify
+    window, or starts `spotify-launcher` when Spotify is not running. On
+    PulseAudio-first Xfce sessions, it also makes Spotify skip the half-present
+    PipeWire path and use PulseAudio playback instead.
+11. Offers to start or restart the panel immediately.
 
 The weather config is written with file mode `0600`, so API keys in URLs are not
 world-readable.
@@ -116,17 +125,34 @@ Closed state:
 Open state:
 
 - System status text: time, CPU load, network latency, uptime, battery if present.
+- Top-right power button aligned with the settings icon column.
 - Weather area: weather icon and current weather label.
-- Shortcut row: four user-configurable icons.
-- Fifth icon: fixed weather API reset button. Click it to open a weather setup
-  dialog and paste a new API URL without editing files manually.
+- Now playing area: reads `org.mpris.MediaPlayer2.spotify` over DBus and shows
+  the current Spotify playback status, title, artist, and album without
+  launching Spotify by itself.
+- Shortcut row order: shell, internet, Spotify, file, weather settings, settings.
+- Spotify button: launches the local `spotify` wrapper first. That wrapper
+  focuses an existing Spotify window or starts the native `spotify-launcher`
+  client when Spotify is not running. The wrapper sets `PIPEWIRE_REMOTE` to a
+  harmless missing remote by default, which makes the current Spotify client
+  fall back to PulseAudio on Xfce systems where PipeWire is present but not the
+  active audio stack. If neither command exists, the panel requests
+  installation of `spotify-launcher` and `playerctl` through `pkexec pacman`,
+  then starts Spotify after installation.
+  The icon prefers the official Spotify app icon from the installed system icon
+  theme, without bundling Spotify logo files into this repository.
+- Weather settings icon: opens a weather setup dialog and lets you paste a new
+  API URL without editing files manually.
+- Power button: opens a separate dialog with `poweroff`, `suspend`,
+  `hibernate`, and `shutdown` controls. Turn on the confirmation switch before
+  a power action can run.
 
 ## Manual Build for Development
 
 Install dependencies:
 
 ```sh
-sudo pacman -S --needed base-devel gtk3 pkgconf curl exo xfce4-settings xfwm4 xfconf clang
+sudo pacman -S --needed base-devel gtk3 pkgconf curl alsa-plugins exo xfce4-settings xfwm4 xfconf clang libx11 pulseaudio pulseaudio-alsa spotify-launcher playerctl libnotify
 ```
 
 Build:
@@ -185,7 +211,12 @@ place=Seoul
 url=https://api.open-meteo.com/v1/forecast?latitude=37.5665&longitude=126.9780&current=temperature_2m,weather_code&timezone=auto
 ```
 
-Four user shortcut slots:
+Four configurable shortcut slots. They are rendered around the fixed Spotify
+and weather-settings buttons:
+
+```text
+1 shell -> 2 internet -> Spotify -> 3 file -> weather settings -> 4 settings
+```
 
 ```ini
 [icons]
