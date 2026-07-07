@@ -1,3 +1,6 @@
+<img width="331" height="250" alt="image" src="https://github.com/user-attachments/assets/40d27f44-b3a3-440f-b2ef-0c7fdec8d11d" />
+
+
 # my_linux_panel
 
 `my_linux_panel` is a tiny Vista-like translucent desktop panel for Arch Linux
