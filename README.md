@@ -1,4 +1,5 @@
-<img width="331" height="250" alt="image" src="https://github.com/user-attachments/assets/40d27f44-b3a3-440f-b2ef-0c7fdec8d11d" />
+<img width="345" height="400" alt="image" src="https://github.com/user-attachments/assets/1d70cbfb-5f13-4052-94a3-b81a04f7c12b" />
+
 
 
 # my_linux_panel
