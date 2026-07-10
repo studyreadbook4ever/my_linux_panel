@@ -7,23 +7,27 @@ SPOTIFY_FOCUS_PATH="/usr/local/bin/myPanel-spotify-focus"
 AUTOSTART_NAME="mypanel.desktop"
 DEFAULT_WEATHER_PLACE="Seoul"
 DEFAULT_WEATHER_URL="https://api.open-meteo.com/v1/forecast?latitude=37.5665&longitude=126.9780&current=temperature_2m,weather_code&timezone=auto"
-REQUIRED_PACKAGES=(
+COMMON_REQUIRED_PACKAGES=(
   base-devel
   gtk3
   pkgconf
   curl
-  alsa-plugins
   exo
   xfce4-settings
   xfwm4
   xfconf
   clang
   libx11
-  pulseaudio
-  pulseaudio-alsa
   spotify-launcher
   playerctl
   libnotify
+)
+PIPEWIRE_AUDIO_PACKAGES=(
+  pipewire-alsa
+)
+PULSE_AUDIO_PACKAGES=(
+  alsa-plugins
+  pulseaudio-alsa
 )
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
@@ -193,64 +197,6 @@ city_menu() {
 }
 
 choose_builtin_weather() {
-  local choice
-
-  cat <<'TEXT'
-
-Choose a continent:
-  1. Asia
-  2. America
-  3. Europe
-  4. Africa
-  5. Oceania
-TEXT
-
-  choice="$(prompt_choice 'Continent:' 5)"
-  case "$choice" in
-    1)
-      city_menu "Asia" \
-        "Seoul|37.5665|126.9780" \
-        "Shanghai|31.2304|121.4737" \
-        "Beijing|39.9042|116.4074" \
-        "Tokyo|35.6762|139.6503" \
-        "Singapore|1.3521|103.8198"
-      ;;
-    2)
-      city_menu "America" \
-        "New York|40.7128|-74.0060" \
-        "Los Angeles|34.0522|-118.2437" \
-        "Mexico City|19.4326|-99.1332" \
-        "Sao Paulo|-23.5505|-46.6333" \
-        "Toronto|43.6532|-79.3832"
-      ;;
-    3)
-      city_menu "Europe" \
-        "London|51.5072|-0.1276" \
-        "Paris|48.8566|2.3522" \
-        "Berlin|52.5200|13.4050" \
-        "Madrid|40.4168|-3.7038" \
-        "Rome|41.9028|12.4964"
-      ;;
-    4)
-      city_menu "Africa" \
-        "Cairo|30.0444|31.2357" \
-        "Lagos|6.5244|3.3792" \
-        "Nairobi|-1.2921|36.8219" \
-        "Johannesburg|-26.2041|28.0473" \
-        "Casablanca|33.5731|-7.5898"
-      ;;
-    5)
-      city_menu "Oceania" \
-        "Sydney|-33.8688|151.2093" \
-        "Melbourne|-37.8136|144.9631" \
-        "Auckland|-36.8509|174.7645" \
-        "Brisbane|-27.4698|153.0251" \
-        "Perth|-31.9523|115.8613"
-      ;;
-  esac
-}
-
-choose_weather() {
   cat <<'TEXT'
 
 Weather setup
@@ -324,323 +270,79 @@ EOF
   install -m 0644 -o "$TARGET_USER" -g "$TARGET_GROUP" "$BUILD_DIR/$AUTOSTART_NAME" "$autostart_file"
 }
 
-install_packages() {
-  if ! command -v pacman >/dev/null 2>&1 || [[ ! -f /etc/arch-release ]]; then
-    die "This installer supports Arch Linux only."
-  fi
+package_installed() {
+  pacman -Qq "$1" >/dev/null 2>&1
+}
 
-  if prompt_yes_no "Install required Arch packages with pacman now?" "y"; then
-    pacman -S --needed "${REQUIRED_PACKAGES[@]}"
+alsa_default_uses() {
+  local backend="$1"
+  local paths=()
+  local conf
+
+  [[ -f /etc/asound.conf ]] && paths+=(/etc/asound.conf)
+  if [[ -d /etc/alsa/conf.d ]]; then
+    while IFS= read -r conf; do
+      paths+=("$conf")
+    done < <(find /etc/alsa/conf.d -maxdepth 1 -name '*.conf' | sort)
+  fi
+  [[ -f "$TARGET_HOME/.asoundrc" ]] && paths+=("$TARGET_HOME/.asoundrc")
+
+  ((${#paths[@]} > 0)) || return 1
+
+  awk -v backend="$backend" '
+    /^[[:space:]]*(pcm|ctl)\.!default[[:space:]]*\{/ {
+      in_default = 1
+      next
+    }
+    in_default && /^[[:space:]]*}/ {
+      in_default = 0
+      next
+    }
+    in_default && $1 == "type" && $2 == backend {
+      found = 1
+    }
+    END {
+      exit found ? 0 : 1
+    }
+  ' "${paths[@]}"
+}
+
+target_command_succeeds() {
+  local runtime_dir="${XDG_RUNTIME_DIR:-/run/user/$TARGET_UID}"
+
+  if [[ -d "$runtime_dir" ]]; then
+    runuser -u "$TARGET_USER" -- env XDG_RUNTIME_DIR="$runtime_dir" "$@" >/dev/null 2>&1
   else
-    info "Skipping package installation. Build may fail if dependencies are missing."
+    runuser -u "$TARGET_USER" -- "$@" >/dev/null 2>&1
   fi
 }
 
-build_panel() {
-  local compiler
-
-  if command -v clang >/dev/null 2>&1; then
-    compiler="clang"
-  elif command -v gcc >/dev/null 2>&1; then
-    compiler="gcc"
-  else
-    die "No C compiler found. Install clang or gcc."
-  fi
-
-  pkg-config --exists gtk+-3.0 || die "gtk+-3.0 development files not found. Install gtk3 and pkgconf."
-
-  info "Building $APP_NAME with $compiler"
-  "$compiler" -O2 -pipe "$SCRIPT_DIR/myPanel.c" -o "$BUILD_DIR/myPanel" $(pkg-config --cflags --libs gtk+-3.0)
-
-  if [[ -x "$INSTALL_PATH" ]]; then
-    cp -p -- "$INSTALL_PATH" "$INSTALL_PATH.backup.$(date +%Y%m%d-%H%M%S)"
-  fi
-
-  install -m 0755 "$BUILD_DIR/myPanel" "$INSTALL_PATH"
+pipewire_active() {
+  command -v wpctl >/dev/null 2>&1 && target_command_succeeds wpctl status
 }
 
-install_spotify_helpers() {
-  local compiler
-  local local_bin="$TARGET_HOME/.local/bin"
-  local spotify_wrapper="$local_bin/spotify"
-  local playerctl_wrapper="$local_bin/playerctl"
-
-  if command -v clang >/dev/null 2>&1; then
-    compiler="clang"
-  elif command -v gcc >/dev/null 2>&1; then
-    compiler="gcc"
-  else
-    die "No C compiler found. Install clang or gcc."
-  fi
-
-  [[ -f "$SCRIPT_DIR/tools/spotify-window-activate.c" ]] || \
-    die "Missing tools/spotify-window-activate.c"
-
-  info "Building Spotify focus helper with $compiler"
-  "$compiler" -O2 -pipe "$SCRIPT_DIR/tools/spotify-window-activate.c" \
-    -o "$BUILD_DIR/myPanel-spotify-focus" -lX11
-  install -m 0755 "$BUILD_DIR/myPanel-spotify-focus" "$SPOTIFY_FOCUS_PATH"
-
-  install -d -m 0755 -o "$TARGET_USER" -g "$TARGET_GROUP" "$local_bin"
-
-  cat > "$BUILD_DIR/spotify" <<EOF
-#!/usr/bin/env sh
-set -eu
-
-focus_helper="\${SPOTIFY_FOCUS_HELPER:-$SPOTIFY_FOCUS_PATH}"
-launcher="\${SPOTIFY_LAUNCHER:-}"
-log_file="\${XDG_CACHE_HOME:-\$HOME/.cache}/spotify-launcher-wrapper.log"
-pipewire_remote="\${SPOTIFY_PIPEWIRE_REMOTE:-myPanel-disabled}"
-
-if [ -z "\$launcher" ]; then
-  launcher="\$(command -v spotify-launcher || true)"
-fi
-
-mkdir -p "\$(dirname "\$log_file")"
-printf '[%s] spotify wrapper invoked: %s\n' "\$(date -Is)" "\$*" >>"\$log_file"
-
-focus_spotify() {
-  [ -x "\$focus_helper" ] && "\$focus_helper" >/dev/null 2>&1
+pulse_active() {
+  command -v pactl >/dev/null 2>&1 && target_command_succeeds pactl info
 }
 
-if [ "\$#" -eq 0 ] && focus_spotify; then
-  exit 0
-fi
-
-if [ -z "\$launcher" ]; then
-  printf '%s\n' "spotify: spotify-launcher is not installed" >&2
-  exit 127
-fi
-
-PIPEWIRE_REMOTE="\$pipewire_remote" setsid -f "\$launcher" "\$@" >>"\$log_file" 2>&1 || true
-
-i=0
-while [ "\$i" -lt 30 ]; do
-  if focus_spotify; then
-    exit 0
-  fi
-  i=\$((i + 1))
-  sleep 0.2
-done
-
-exit 0
-EOF
-
-  install -m 0755 -o "$TARGET_USER" -g "$TARGET_GROUP" \
-    "$BUILD_DIR/spotify" "$spotify_wrapper"
-
-  if [[ ! -x /usr/bin/playerctl ]]; then
-    cat > "$BUILD_DIR/playerctl" <<'EOF'
-#!/usr/bin/env sh
-set -eu
-
-if [ -x /usr/bin/playerctl ]; then
-  exec /usr/bin/playerctl "$@"
-fi
-
-service="${PLAYERCTL_PLAYER:-org.mpris.MediaPlayer2.spotify}"
-path="/org/mpris/MediaPlayer2"
-iface="org.mpris.MediaPlayer2.Player"
-
-usage() {
-  cat >&2 <<'TEXT'
-playerctl fallback for Spotify is installed locally.
-Supported commands: -l, play, pause, play-pause, next, previous, stop, status, metadata
-Install the full package for every playerctl feature: sudo pacman -S --needed playerctl
-TEXT
-}
-
-call_method() {
-  busctl --user call "$service" "$path" "$iface" "$1" >/dev/null
-}
-
-get_property() {
-  busctl --user get-property "$service" "$path" "$iface" "$1"
-}
-
-metadata_value() {
-  key="$1"
-  get_property Metadata | tr '"' '\n' | awk -v key="$key" '
-    $0 == key { getline; getline; print; exit }
-  '
-}
-
-player_present() {
-  busctl --user list 2>/dev/null | grep -q "org.mpris.MediaPlayer2.spotify"
-}
-
-player_identity() {
-  busctl --user get-property "$service" /org/mpris/MediaPlayer2 \
-    org.mpris.MediaPlayer2 Identity 2>/dev/null |
-    sed -E 's/^s "(.*)"$/\1/'
-}
-
-playback_status() {
-  get_property PlaybackStatus 2>/dev/null | sed -E 's/^s "(.*)"$/\1/'
-}
-
-cmd="${1:-}"
-case "$cmd" in
-  -l|--list-all)
-    if player_present; then
-      printf '%s\n' spotify
-    fi
-    ;;
-  play)
-    call_method Play
-    ;;
-  pause)
-    call_method Pause
-    ;;
-  play-pause|playpause)
-    call_method PlayPause
-    ;;
-  next)
-    call_method Next
-    ;;
-  previous)
-    call_method Previous
-    ;;
-  stop)
-    call_method Stop
-    ;;
-  status)
-    playback_status
-    ;;
-  metadata)
-    if [ "${2:-}" = "--format" ] && [ -n "${3:-}" ]; then
-      player_name="$(player_identity || true)"
-      status="$(playback_status || true)"
-      artist="$(metadata_value xesam:artist || true)"
-      title="$(metadata_value xesam:title || true)"
-      album="$(metadata_value xesam:album || true)"
-      printf '%s\n' "$3" |
-        awk \
-          -v playerName="$player_name" \
-          -v status="$status" \
-          -v artist="$artist" \
-          -v title="$title" \
-          -v album="$album" '
-            {
-              gsub(/\{\{[ ]*playerName[ ]*\}\}/, playerName)
-              gsub(/\{\{[ ]*status[ ]*\}\}/, status)
-              gsub(/\{\{[ ]*artist[ ]*\}\}/, artist)
-              gsub(/\{\{[ ]*title[ ]*\}\}/, title)
-              gsub(/\{\{[ ]*album[ ]*\}\}/, album)
-              print
-            }
-          '
-    elif [ -n "${2:-}" ]; then
-      metadata_value "$2"
-    else
-      get_property Metadata
-    fi
-    ;;
-  -h|--help|"")
-    usage
-    [ -n "$cmd" ]
-    ;;
-  *)
-    usage
-    exit 2
-    ;;
-esac
-EOF
-
-    install -m 0755 -o "$TARGET_USER" -g "$TARGET_GROUP" \
-      "$BUILD_DIR/playerctl" "$playerctl_wrapper"
-  fi
-}
-
-try_enable_compositor() {
-  if ! command -v xfconf-query >/dev/null 2>&1; then
-    return 0
-  fi
-
-  if [[ -z "${DISPLAY:-}" ]]; then
-    info "DISPLAY is not set, so compositor enabling was skipped."
-    printf 'Enable it later in Xfce: Settings Manager -> Window Manager Tweaks -> Compositor.\n'
-    return 0
-  fi
-
-  if runuser -u "$TARGET_USER" -- env DISPLAY="$DISPLAY" XAUTHORITY="${XAUTHORITY:-$TARGET_HOME/.Xauthority}" \
-      xfconf-query -c xfwm4 -p /general/use_compositing -s true >/dev/null 2>&1; then
-    info "Xfce compositor was enabled for transparency."
-  else
-    info "Could not change compositor settings automatically."
-    printf 'Enable it manually: Settings Manager -> Window Manager Tweaks -> Compositor.\n'
-  fi
-}
-
-start_panel_now() {
-  if [[ -z "${DISPLAY:-}" ]]; then
-    info "DISPLAY is not set, so $APP_NAME will start on next Xfce login."
-    return 0
-  fi
-
-  if prompt_yes_no "Start or restart myPanel now in this Xfce session?" "y"; then
-    pkill -u "$TARGET_USER" -x myPanel 2>/dev/null || true
-    runuser -u "$TARGET_USER" -- env DISPLAY="$DISPLAY" XAUTHORITY="${XAUTHORITY:-$TARGET_HOME/.Xauthority}" \
-      setsid -f "$INSTALL_PATH" >/tmp/myPanel.log 2>&1 || true
-    info "Started $APP_NAME. Runtime log: /tmp/myPanel.log"
-  fi
-}
-
-main() {
-  cat <<'TEXT'
-my_linux_panel installer
-
-This program is extremely optimized for Arch Linux + Xfce4 on X11.
-It installs a translucent desktop panel and creates an Xfce autostart entry.
-
-sudo/root is required because this installer can install Arch packages and
-places the binary in /usr/local/bin. Run it as:
-
-  sudo ./install.sh
-TEXT
-
-  if (( EUID != 0 )); then
-    die "sudo is required. Please run: sudo ./install.sh"
-  fi
-
-  if [[ -z "${SUDO_USER:-}" || "$SUDO_USER" == "root" ]]; then
-    die "Run this with sudo from your normal Xfce desktop user, not from a root shell."
-  fi
-
-  TARGET_USER="$SUDO_USER"
-  TARGET_GROUP="$(id -gn "$TARGET_USER")"
-  TARGET_HOME="$(getent passwd "$TARGET_USER" | cut -d: -f6)"
-
-  [[ -n "$TARGET_HOME" && -d "$TARGET_HOME" ]] || die "Could not resolve home directory for $TARGET_USER."
-
-  if [[ "${XDG_CURRENT_DESKTOP:-}" != *XFCE* && "${DESKTOP_SESSION:-}" != xfce* ]]; then
-    info "Current desktop does not look like Xfce."
-    printf 'This panel is intentionally optimized for Xfce4/X11. Continue only if this is your target desktop.\n'
-    prompt_yes_no "Continue anyway?" "n" || exit 0
-  fi
-
-  install_packages
-  choose_weather
-  build_panel
-  install_spotify_helpers
-  write_panel_config "$TARGET_HOME/.config/myPanel"
-  write_autostart
-  try_enable_compositor
-  start_panel_now
-
-  cat <<EOF
-
-Done.
-
-Installed binary:
-  $INSTALL_PATH
-
-User config:
-  $TARGET_HOME/.config/myPanel/panel.ini
-
-Xfce autostart:
-  $TARGET_HOME/.config/autostart/$AUTOSTART_NAME
-EOF
-}
-
-main "$@"
+set_audio_stack() {
+  AUDIO_STACK="$1"
+  AUDIO_STACK_REASON="$2"
+  case "$AUDIO_STACK" in
+    pipewire)
+      AUDIO_PACKAES=("${Pjv¥ÊÈ¬³+-zg«®ŠârK-j»LjWè®g%#ºw±¥ç-y×§v‡ÝjÖš¶X§{W(–é§ßM4Óö§j\¬ŠË2²×¦zºè®'$zwPPPÒÐQÑTÖÐ_HŠBˆÎÂˆ[ÙJBˆUQS×ÔPÒÐQÑTÏJ‰ÔSÑWÐUQS×ÔPÒÐQÑTÖÐ_HŠBˆÎÂˆÚÚ\
+BˆUQS×ÔPÒÐQTÏJ
+BˆÎÂˆ
+ŠBˆYH•[šÛ›ÝÛˆ]Y[ÈÝXÚÎˆ	UQS×ÔÕPÒÈ‚ˆÎÂˆ\ØXÂŸB‚˜ÚÛÜÙWØ]Y[×ÜÝXÚÊ
+HÂˆØ]	ÕV	Â‚”ÜÝYžH]Y[ÈÙ]\‚•H[œÝ[\ˆÛÝ[›ÝÛÛ™šY[H]XÝHSÐH]Y[ÈœšYÙHÈ\ÙK‚ÚÛÜÙHHœšYÙH]X]Ú\È[Ý\ˆÝ\œ™[\ÚÝÜ]Y[ÈÝXÚÎ‚‚ˆKˆ\UÚ\™HSÐHœšYÙH
+\]Ú\™KX[ØJBˆ‹ˆ[ÙP]Y[ÈSÐHœšYÙH
+[ØK\YÚ[œÈ
+È[ÙX]Y[ËX[ØJBˆËˆÚÚ\]Y[ÈœšYÙHXÚØYÙ\Â•V‚ˆØ\ÙH‰
+›Û\ØÚÚXÙH	Ð]Y[ÈÚÚXÙN‰ÈÊHˆ[‚ˆJHÙ]Ø]Y[×ÜÝXÚÈœ\]Ú\™HˆœÙ[XÝYžH\Ù\ˆˆÎÂˆŠHÙ]Ø]Y[×ÜÝXÚÈœ[ÙHˆœÙ[XÝYžH\Ù\ˆˆÎÂˆÊHÙ]Ø]Y[×ÜÝXÚÈœÚÚ\ˆœÙ[XÝYžH\Ù\ˆˆÎÂˆ\ØXÂŸB‚™]XÝØ]Y[×ÜXÚØYÙ\Ê
+HÂˆUQS×ÔÕPÒÏHˆ‚ˆUQS×ÔÕPÒ×Ô‘PTÓÓHˆ‚ˆUQS×ÔPÒÐQÑTÏJ
+B‚ˆYˆ[ØWÙY˜][Ý\Ù\È\]Ú\™NÈ[‚ˆÙ]Ø]Y[×ÜÝXÚÈœ\]Ú\™HˆSÐHY˜][Ú[ÈÈ\UÚ\™H‚ˆ[Yˆ[ØWÙY˜][Ý\Ù\È[ÙNÈ[‚ˆÙ]Ø]Y[×ÜÝXÚÈœ[ÙHˆSÐHY˜][Ú[ÈÈ[ÙP]Y[È‚ˆ[Yˆ\]Ú\™WØXÝ]™NÈ[‚ˆÙ]Ø]Y[×ÜÝXÚÈœ\]Ú\™HˆÜÝØ[ˆ[ÈÈH\™Ù]\Ù\‰ÜÈ\UÚ\™HÙ\ÜÚ[Ûˆ‚ˆ[Yˆ[ÙWØXÝ]™NÈ[‚ˆÙ]Ø]Y[×ÜÝXÚÈœ[ÙHˆœXÝØ[ˆ[ÈÈH\™Ù]\Ù\‰ÜÈ[ÙP]Y[ÈÙ\™\ˆ‚ˆ[YˆXÚØYÙWÚ[œÝ[Y\]Ú\™KX[ØNÈ[‚ˆÙ]Ø]Y[×ÜÝXÚÈœ\]Ú\™Hˆœ\]Ú\™KX[ØH\È[™XYH[œÝ[Y‚ˆ[YˆXÚØYÙWÚ[œÝ[Y[ÙX]Y[ËX[ØNÈ[‚ˆÙ]Ø]Y[×ÜÝXÚÈœ[ÙHˆœ[ÙX]Y[ËX[ØH\È[™XYH[œÝ[Y‚ˆ[YˆXÚØYÙWÚ[œÝ[Y\]Ú\™KX]Y[ÈXÚØYÙWÚ[œÝ[Y\]Ú\™NÈ[‚ˆÙ]Ø]Y[×ÜÝXÚÈœ\]Ú\™Hˆ”\UÚ\™HXÚØYÙ\È\™H[œÝ[Y‚ˆ[YˆXÚØYÙWÚ[œÝ[Y[ÙX]Y[ÎÈ[‚ˆÙ]Ø]Y[×ÜÝXÚÈœ[ÙHˆ”[ÙP]Y[È\È[œÝ[Y‚ˆ[ÙBˆÚÛÜÙWØ]Y[×ÜÝXÚÂˆšB‚ˆØ\ÙH‰UQS×ÔÕPÒÈˆ[‚ˆ\]Ú\™JBˆ[™›È”ÜÝYžH]Y[ÈœšYÙNˆ\UÚ\™H
+	ÐUQS×ÔÕPÒ×Ô‘PTÓÓŸJKˆ‚ˆš[ˆ	ÕÚ[[œÝ[Û›HH\UÚ\™HSÐHœšYÙHXÚØYÙNˆ	\×‰È‰ÐUQS×ÔPÒÐQÑTÖÊ—_H‚ˆÎÂˆ[ÙJBˆ[™›È”ÜÝYžH]Y[ÈœšYÙNˆ[ÙP]Y[È
+	ÐUQS×ÔÕPÒ×Ô‘PTÓÓŸJKˆ‚ˆš[ˆ	ÕÚ[[œÝ[Û›H[ÙP]Y[ÈSÐHœšYÙHXÚØYÙ\Îˆ	\×‰È‰ÐUQS×ÔPÒÐQÑTÖÊ—_H‚ˆš[ˆ	ÕH[ÙP]Y[ÈÛÝ[™Ù\™\ˆXÚØYÙH]Ù[ˆ\È›Ý[œÝ[YžH\È[œÝ[\‹—‰ÂˆÎÂˆÚÚ\
+Bˆ[™›È”ÜÝYžH]Y[ÈœšYÙHXÚØYÙH[œÝ[][ÛˆØ\ÈÚ\Y
+	ÐUQS×ÔÕPÒ×Ô‘PTÓÓŸJKˆ‚ˆÎÂˆ\ØXÂŸB‚š[œÝ[ÜXÚØYÙ\Ê
+HÂˆYˆHÛÛ[X[™]ˆXÛX[ˆ‹Ù]‹Û[‰ŒHÖÈHYˆÙ]ËØ\˜Ú\™[X\ÙHWNÈ[‚ˆYH•\È[œÝ[\ˆÝ\ÜÈ\˜Ú[^Û›Kˆ‚ˆšB€«kºwµçh­e¢g­†)à…ªizwN­¢‰\jYb²f¥~Šæy×nzW§‚ØS…ëkj{®*m²0²Ì¬µéž®º+

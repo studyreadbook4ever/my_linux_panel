@@ -49,18 +49,48 @@ desktop does not look like Xfce.
 6. Creates `~/.config/myPanel/panel.ini` for the real desktop user.
 7. Creates `~/.config/autostart/mypanel.desktop` for Xfce login startup.
 8. Tries to enable the Xfce compositor for real transparency.
-9. Installs `spotify-launcher`, `playerctl`, `libnotify`, and the PulseAudio
-   ALSA bridge packages so the Spotify button can use the native desktop client
-   and MPRIS-friendly Linux media stack.
+9. Detects the current ALSA audio bridge and installs only the matching bridge
+   packages for Spotify: `pipewire-alsa` for PipeWire, or `alsa-plugins` +
+   `pulseaudio-alsa` for PulseAudio. The installer does not install the
+   PulseAudio sound server package or switch the machine from one audio stack
+   to another.
 10. Builds a tiny X11 Spotify focus helper and writes a `~/.local/bin/spotify`
     wrapper for the desktop user. The wrapper focuses an existing Spotify
-    window, or starts `spotify-launcher` when Spotify is not running. On
-    PulseAudio-first Xfce sessions, it also makes Spotify skip the half-present
-    PipeWire path and use PulseAudio playback instead.
+    window, or directly starts the Spotify Linux binary prepared by
+    `spotify-launcher` under `~/.local/share/spotify-launcher`. If that cached
+    binary is missing, the wrapper asks `spotify-launcher` to prepare it first.
 11. Offers to start or restart the panel immediately.
 
 The weather config is written with file mode `0600`, so API keys in URLs are not
 world-readable.
+
+## Installer Audio Detection
+
+Spotify's Linux binary uses the system audio stack. The installer keeps that
+stack intact and only installs the ALSA bridge that matches the existing setup.
+
+Detection order:
+
+1. Current `pcm.!default` / `ctl.!default` ALSA backend.
+2. The target desktop user's live PipeWire or PulseAudio session.
+3. Already installed bridge packages.
+4. Installed PipeWire or PulseAudio packages.
+5. A manual choice if the stack is still unclear.
+
+For PipeWire systems, the installer uses:
+
+```sh
+pipewire-alsa
+```
+
+For PulseAudio systems, the installer uses:
+
+```sh
+alsa-plugins pulseaudio-alsa
+```
+
+It intentionally avoids installing `pulseaudio` itself because that can replace
+or compete with an existing PipeWire setup.
 
 ## Installer Weather Flow
 
@@ -130,13 +160,12 @@ Open state:
 - Weather area: weather icon and current weather label.
 - Shortcut row order: shell, internet, Spotify, file, weather settings, settings.
 - Spotify button: launches the local `spotify` wrapper first. That wrapper
-  focuses an existing Spotify window or starts the native `spotify-launcher`
-  client when Spotify is not running. The wrapper sets `PIPEWIRE_REMOTE` to a
-  harmless missing remote by default, which makes the current Spotify client
-  fall back to PulseAudio on Xfce systems where PipeWire is present but not the
-  active audio stack. If neither command exists, the panel requests
-  installation of `spotify-launcher` and `playerctl` through `pkexec pacman`,
-  then starts Spotify after installation.
+  focuses an existing Spotify window or starts the cached Spotify Linux binary
+  from `~/.local/share/spotify-launcher/install/usr/share/spotify/spotify`.
+  If the cached binary is missing, it asks `spotify-launcher` to prepare it.
+  If neither command exists, the panel requests installation of
+  `spotify-launcher` and `playerctl` through `pkexec pacman`, then starts
+  Spotify after installation.
   The icon prefers the official Spotify app icon from the installed system icon
   theme, without bundling Spotify logo files into this repository.
 - Embedded Spotify player: placed directly under the shortcut row. It reads
@@ -161,7 +190,17 @@ Open state:
 Install dependencies:
 
 ```sh
-sudo pacman -S --needed base-devel gtk3 pkgconf curl alsa-plugins exo xfce4-settings xfwm4 xfconf clang libx11 pulseaudio pulseaudio-alsa spotify-launcher playerctl libnotify
+sudo pacman -S --needed base-devel gtk3 pkgconf curl exo xfce4-settings xfwm4 xfconf clang libx11 spotify-launcher playerctl libnotify
+```
+
+Then install the ALSA bridge that matches your audio stack:
+
+```sh
+# PipeWire
+sudo pacman -S --needed pipewire-alsa
+
+# PulseAudio
+sudo pacman -S --needed alsa-plugins pulseaudio-alsa
 ```
 
 Build:
@@ -320,7 +359,7 @@ xfconf-query -c xfwm4 -p /general/use_compositing -s true
 Weather says `install curl`:
 
 ```sh
-sudo pacman -S --needed curl
+sudo `acman -S --needed curl
 ```
 
 Weather says `parse fail`:
