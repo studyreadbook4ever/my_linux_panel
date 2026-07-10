@@ -359,7 +359,7 @@ xfconf-query -c xfwm4 -p /general/use_compositing -s true
 Weather says `install curl`:
 
 ```sh
-sudo `acman -S --needed curl
+sudo pacman -S --needed curl
 ```
 
 Weather says `parse fail`:
