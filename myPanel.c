@@ -2,7 +2,7 @@
  * Small translucent Xfce4/X11 state panel.
  *
  * Build:
- *   gcc -O2 -pipe myPanel.c -o myPanel $(pkg-config --cflags --libs gtk+-3.0)
+ *   gcc -O2 -pipe myPanel.c notification_center.c -o myPanel $(pkg-config --cflags --libs gtk+-3.0)
  *
  * Run:
  *   ./myPanel
@@ -17,6 +17,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+
+#include "notification_center.h"
 
 #define WINDOW_X 0
 #define WINDOW_Y 0
@@ -51,6 +53,7 @@ typedef struct {
     GtkWidget *weather_reset_image;
     GtkWidget *power_button;
     GtkWidget *power_image;
+    NotificationCenter *notifications;
 
     char config_path[PATH_MAX];
     char time_line[64];
@@ -1352,6 +1355,9 @@ static gboolean apply_input_region_cb(gpointer data) {
 
     if (st->expanded) {
         add_widget_region(st->window, st->power_button, region, 2);
+        add_widget_region(st->window,
+                          notification_center_get_button(st->notifications),
+                          region, 2);
         add_widget_region(st->window, st->icon_buttons[0], region, 2);
         add_widget_region(st->window, st->icon_buttons[1], region, 2);
         add_widget_region(st->window, st->spotify_button, region, 2);
@@ -2315,10 +2321,19 @@ static GtkWidget *build_ui(AppState *st) {
     g_signal_connect(st->power_button, "clicked",
                      G_CALLBACK(on_power_clicked), st);
 
+    GtkWidget *right_controls = gtk_box_new(GTK_ORIENTATION_VERTICAL, 6);
+    gtk_widget_set_valign(right_controls, GTK_ALIGN_START);
+    gtk_box_pack_start(GTK_BOX(right_controls), st->power_button,
+                       FALSE, FALSE, 0);
+    st->notifications = notification_center_new(GTK_WINDOW(st->window));
+    gtk_box_pack_start(GTK_BOX(right_controls),
+                       notification_center_get_button(st->notifications),
+                       FALSE, FALSE, 0);
+
     gtk_box_pack_start(GTK_BOX(top_row), st->info_label,
                        TRUE, TRUE, 0);
-    gtk_box_pack_end(GTK_BOX(top_row), st->power_button,
-                     FALSE, FALSE, 0);
+    gtk_box_pack_end(GTK_BOX(top_row), right_controls,
+                       FALSE, FALSE, 0);
 
     gtk_box_pack_start(GTK_BOX(st->details_box), top_row,
                        FALSE, FALSE, 0);
@@ -2395,6 +2410,7 @@ int main(int argc, char **argv) {
     update_spotify_now(&st);
 
     gtk_main();
+    notification_center_free(st.notifications);
     if (st.session_bus)
         g_object_unref(st.session_bus);
     return 0;

@@ -21,6 +21,7 @@ COMMON_REQUIRED_PACKAGES=(
   spotify-launcher
   playerctl
   libnotify
+  xfce4-notifyd
 )
 PIPEWIRE_AUDIO_PACKAGES=(
   pipewire-alsa
@@ -492,7 +493,7 @@ build_panel() {
   pkg-config --exists gtk+-3.0 || die "gtk+-3.0 development files not found. Install gtk3 and pkgconf."
 
   info "Building $APP_NAME with $compiler"
-  "$compiler" -O2 -pipe "$SCRIPT_DIR/myPanel.c" -o "$BUILD_DIR/myPanel" $(pkg-config --cflags --libs gtk+-3.0)
+  "$compiler" -O2 -pipe "$SCRIPT_DIR/myPanel.c" "$SCRIPT_DIR/notification_center.c" -o "$BUILD_DIR/myPanel" $(pkg-config --cflags --libs gtk+-3.0)
 
   if [[ -x "$INSTALL_PATH" ]]; then
     cp -p -- "$INSTALL_PATH" "$INSTALL_PATH.backup.$(date +%Y%m%d-%H%M%S)"

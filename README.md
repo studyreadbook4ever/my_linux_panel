@@ -9,13 +9,14 @@
 
 It starts as one small `menu` button in the top-left corner. Pressing `menu`
 opens a glass panel with system status text, weather, Spotify now playing,
-native Spotify launch, shortcut icons, a weather-reset icon, settings, and a
-guarded power dialog.
+native Spotify launch, shortcut icons, a weather-reset icon, settings, a
+guarded power dialog, and an Xfce notification inbox.
 
 The glass area is click-through on X11. Only these widgets catch clicks:
 
 - `menu` / `close`
 - the top-right power button
+- the notification bell directly below the power button
 - shell, internet, Spotify, file, weather settings, and settings icons
 
 ## Quick Install on Arch Linux + Xfce4
@@ -157,6 +158,9 @@ Open state:
 
 - System status text: time, CPU load, network latency, uptime, battery if present.
 - Top-right power button aligned with the settings icon column.
+- Notification bell directly below the power button. An unread dot appears
+  when Xfce has unread notifications. Clicking the bell opens a separate,
+  scrollable notification inbox without blocking the panel.
 - Weather area: weather icon and current weather label.
 - Shortcut row order: shell, internet, Spotify, file, weather settings, settings.
 - Spotify button: launches the local `spotify` wrapper first. That wrapper
@@ -185,12 +189,43 @@ Open state:
   slider and runs `shutdown now` at 0 minutes or `shutdown +N` for a delayed
   shutdown.
 
+## Notification Inbox
+
+The inbox uses the existing `xfce4-notifyd` notification history over its
+`org.xfce.Notifyd.Log` D-Bus interface (tested with xfce4-notifyd 0.9.7).
+The existing Xfce notification popups keep working. The panel does not replace
+the notification daemon or use a cloud service.
+
+Enable notification logging in **Notification settings -> Log**. To save
+ordinary notifications as they arrive, enable logging and select **Always**.
+The same settings can be applied from your desktop user's terminal:
+
+```sh
+xfconf-query -c xfce4-notifyd -p /notification-log --create -t bool -s true
+xfconf-query -c xfce4-notifyd -p /log-level --create -t string -s always
+```
+
+The inbox shows app names, timestamps, titles, bodies, and read status. It loads
+100 entries at a time, with **More (100)** for older entries, up to the latest
+1,000 entries. **Mark read**, **Delete**, and **Mark all read** update Xfce's
+shared history. Opening or closing the inbox does not mark notifications read.
+Deletion removes the selected saved entry, without closing the source app.
+
+History survives panel restarts because Xfce stores it. Notifications received
+before logging was enabled cannot be recovered, and Xfce's app exclusions,
+transient-notification rules, and retention settings still apply. The bell
+tracks unread state even while the panel or inbox is closed. Updates follow
+D-Bus signals; there is no notification polling loop.
+
+If history is empty or unavailable, use the inbox's **Notification settings**
+button to check logging and the installed xfce4-notifyd version.
+
 ## Manual Build for Development
 
 Install dependencies:
 
 ```sh
-sudo pacman -S --needed base-devel gtk3 pkgconf curl exo xfce4-settings xfwm4 xfconf clang libx11 spotify-launcher playerctl libnotify
+sudo pacman -S --needed base-devel gtk3 pkgconf curl exo xfce4-settings xfwm4 xfconf clang libx11 spotify-launcher playerctl libnotify xfce4-notifyd
 ```
 
 Then install the ALSA bridge that matches your audio stack:
@@ -206,13 +241,13 @@ sudo pacman -S --needed alsa-plugins pulseaudio-alsa
 Build:
 
 ```sh
-clang -O2 -pipe myPanel.c -o myPanel $(pkg-config --cflags --libs gtk+-3.0)
+clang -O2 -pipe myPanel.c notification_center.c -o myPanel $(pkg-config --cflags --libs gtk+-3.0)
 ```
 
 `gcc` works too when the local GCC toolchain is healthy:
 
 ```sh
-gcc -O2 -pipe myPanel.c -o myPanel $(pkg-config --cflags --libs gtk+-3.0)
+gcc -O2 -pipe myPanel.c notification_center.c -o myPanel $(pkg-config --cflags --libs gtk+-3.0)
 ```
 
 Run locally:
@@ -220,6 +255,16 @@ Run locally:
 ```sh
 ./myPanel
 ```
+
+Notification integration checks (requires GTK development files, `dbus-run-session`,
+and an available X11 display):
+
+```sh
+tests/run-notification-tests.sh
+```
+
+These checks use synthetic notifications on an isolated D-Bus session. They do
+not read or modify the desktop's actual notification history.
 
 ## Xfce Transparency
 
